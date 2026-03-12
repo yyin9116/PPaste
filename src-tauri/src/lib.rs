@@ -82,17 +82,8 @@ pub struct AppState {
     pub suppressed_text: Arc<Mutex<Option<String>>>,
     pub last_image_hash: Arc<Mutex<Option<u64>>>, // 图片去重
     pub active_toggle_shortcut: Arc<Mutex<String>>,
+    pub ignore_focus_loss_until: Arc<Mutex<Option<Instant>>>,
 }
-
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct CommandTapState {
-    last_tap_at: Option<Instant>,
-    meta_down: bool,
-    tap_candidate: bool,
-}
-
-const DOUBLE_COMMAND_SHORTCUT: &str = "DoubleCommand";
 
 // --- 数据库初始化 ---
 
@@ -205,6 +196,23 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                 return;
             }
         };
+
+        if let Ok(text) = clipboard.get_text() {
+            let mut last_clip = state.last_clip.lock().unwrap();
+            *last_clip = Some(text);
+        }
+
+        if let Ok(image_data) = clipboard.get_image() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+            image_data.bytes.hash(&mut hasher);
+            let image_hash = hasher.finish();
+
+            let mut last_hash = state.last_image_hash.lock().unwrap();
+            *last_hash = Some(image_hash);
+        }
         
         loop {
             let is_paused = *state.is_paused.lock().unwrap();
@@ -386,30 +394,25 @@ fn detect_category(content: &str) -> Option<String> {
 }
 
 fn normalize_shortcut(input: &str) -> String {
-    let normalized = input
+    input
         .trim()
         .replace("Option", "Alt")
         .replace("OPTION", "Alt")
         .replace("option", "Alt")
         .replace("Command", "Meta")
         .replace("COMMAND", "Meta")
-        .replace("command", "Meta");
-
-    if normalized.eq_ignore_ascii_case("doublecommand")
-        || normalized.eq_ignore_ascii_case("double command")
-        || normalized == "双击Command"
-        || normalized == "双击 Command"
-    {
-        DOUBLE_COMMAND_SHORTCUT.to_string()
-    } else {
-        normalized
-    }
+        .replace("command", "Meta")
 }
 
 fn show_main_window(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Regular)
         .map_err(|e| e.to_string())?;
+
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        let mut ignore_focus_loss_until = state.ignore_focus_loss_until.lock().unwrap();
+        *ignore_focus_loss_until = Some(Instant::now() + Duration::from_millis(350));
+    }
 
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -456,82 +459,14 @@ fn paste_active_app() -> Result<(), String> {
     Err("Direct paste is only implemented on macOS".to_string())
 }
 
-#[cfg(target_os = "macos")]
-fn start_double_command_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
-    thread::spawn(move || {
-        use rdev::{listen, EventType, Key};
-
-        let tap_state = Arc::new(Mutex::new(CommandTapState::default()));
-        let tap_state_clone = Arc::clone(&tap_state);
-        let state_clone = Arc::clone(&state);
-
-        let callback = move |event: rdev::Event| {
-            let active_shortcut = state_clone.active_toggle_shortcut.lock().unwrap().clone();
-            if active_shortcut != DOUBLE_COMMAND_SHORTCUT {
-                return;
-            }
-
-            let mut tap_state = tap_state_clone.lock().unwrap();
-            match event.event_type {
-                EventType::KeyPress(Key::MetaLeft) | EventType::KeyPress(Key::MetaRight) => {
-                    tap_state.meta_down = true;
-                    tap_state.tap_candidate = true;
-                }
-                EventType::KeyPress(_) if tap_state.meta_down => {
-                    tap_state.tap_candidate = false;
-                }
-                EventType::KeyRelease(Key::MetaLeft) | EventType::KeyRelease(Key::MetaRight) => {
-                    let is_tap = tap_state.meta_down && tap_state.tap_candidate;
-                    tap_state.meta_down = false;
-                    tap_state.tap_candidate = false;
-
-                    if !is_tap {
-                        return;
-                    }
-
-                    let now = Instant::now();
-                    let should_toggle = tap_state
-                        .last_tap_at
-                        .map(|last| now.duration_since(last) <= Duration::from_millis(350))
-                        .unwrap_or(false);
-                    tap_state.last_tap_at = Some(now);
-                    drop(tap_state);
-
-                    if should_toggle {
-                        let _ = toggle_main_window(&app);
-                    }
-                }
-                EventType::KeyRelease(_) => {
-                    tap_state.meta_down = false;
-                    tap_state.tap_candidate = false;
-                }
-                _ => {}
-            }
-        };
-
-        if let Err(error) = listen(callback) {
-            eprintln!("Double-command monitor failed: {:?}", error);
-        }
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-fn start_double_command_monitor(_app: tauri::AppHandle, _state: Arc<AppState>) {}
-
 fn apply_toggle_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: String) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     let shortcut = normalize_shortcut(&shortcut_raw);
 
     let previous = state.active_toggle_shortcut.lock().unwrap().clone();
-    if !previous.is_empty() && previous != DOUBLE_COMMAND_SHORTCUT {
+    if !previous.is_empty() {
         let _ = app.global_shortcut().unregister(previous.as_str());
-    }
-
-    if shortcut == DOUBLE_COMMAND_SHORTCUT {
-        let mut active = state.active_toggle_shortcut.lock().unwrap();
-        *active = shortcut;
-        return Ok(());
     }
 
     let parsed = tauri_plugin_global_shortcut::Shortcut::from_str(&shortcut)
@@ -1040,6 +975,7 @@ pub fn run() {
         suppressed_text: Arc::new(Mutex::new(None)),
         last_image_hash: Arc::new(Mutex::new(None)),
         active_toggle_shortcut: Arc::new(Mutex::new(default_settings.toggle_window_shortcut.clone())),
+        ignore_focus_loss_until: Arc::new(Mutex::new(None)),
     });
     
     // 剪贴板监控在 setup 后启动
@@ -1109,7 +1045,6 @@ pub fn run() {
 
             // 启动剪贴板监控（需要 AppHandle 用于事件推送）
             start_clipboard_monitor(app.handle().clone(), Arc::clone(&app_state));
-            start_double_command_monitor(app.handle().clone(), Arc::clone(&app_state));
             
             // 注册全局快捷键（支持设置页动态修改）
             let current_shortcut = {
@@ -1125,10 +1060,23 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             use tauri::WindowEvent;
+
             if window.label() != "main" {
                 return;
             }
+
             if let WindowEvent::Focused(false) = event {
+                if let Some(state) = window.try_state::<Arc<AppState>>() {
+                    let mut ignore_focus_loss_until = state.ignore_focus_loss_until.lock().unwrap();
+                    if ignore_focus_loss_until
+                        .as_ref()
+                        .is_some_and(|until| Instant::now() <= *until)
+                    {
+                        return;
+                    }
+                    *ignore_focus_loss_until = None;
+                }
+
                 let _ = window.hide();
             }
         })

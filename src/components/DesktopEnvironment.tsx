@@ -110,13 +110,11 @@ export default function DesktopEnvironment() {
           launchAtLogin: '开机启动',
           launchAtLoginDesc: '系统登录后自动启动 PPaste。',
           shortcuts: '快捷键绑定',
-          shortcutsDesc: '点击录制后直接按键。也可以一键选择双击 Command 触发。',
+          shortcutsDesc: '点击当前快捷键后直接按键，保存后立即生效。',
           screenshotShortcut: '截图快捷键',
           toggleWindowShortcut: '显示/隐藏窗口',
           shortcutPlaceholder: '点击后按下快捷键',
-          shortcutRecord: '点击录制',
           shortcutRecording: '按下快捷键...',
-          shortcutDoubleCommand: '双击 Command',
           shortcutClear: '清空',
           save: '保存',
           saved: '快捷键已更新',
@@ -153,13 +151,11 @@ export default function DesktopEnvironment() {
           launchAtLogin: 'Launch at login',
           launchAtLoginDesc: 'Start PPaste at system login.',
           shortcuts: 'Shortcut bindings',
-          shortcutsDesc: 'Click record and press the shortcut. You can also choose double-Command directly.',
+          shortcutsDesc: 'Click the current shortcut, press the keys, then save to apply it immediately.',
           screenshotShortcut: 'Screenshot shortcut',
           toggleWindowShortcut: 'Show/Hide window',
           shortcutPlaceholder: 'Click and press a shortcut',
-          shortcutRecord: 'Record',
           shortcutRecording: 'Press shortcut...',
-          shortcutDoubleCommand: 'Double Command',
           shortcutClear: 'Clear',
           save: 'Save',
           saved: 'Shortcut updated',
@@ -549,14 +545,14 @@ export default function DesktopEnvironment() {
                   />
 
                   <div
-                    className={`rounded-xl border p-4 ${
+                    className={`rounded-xl border p-3 ${
                       theme === 'dark' ? 'border-gray-800 bg-gray-950/50' : 'border-gray-100 bg-gray-50'
                     }`}
                   >
-                    <div className="mb-1 text-sm font-semibold tracking-tight">{t.shortcuts}</div>
-                    <p className="mb-3 text-xs text-gray-500 dark:text-gray-400">{t.shortcutsDesc}</p>
+                    <div className="mb-1 text-sm font-semibold leading-none tracking-tight">{t.shortcuts}</div>
+                    <p className="mb-2 text-xs leading-4 text-gray-500 dark:text-gray-400">{t.shortcutsDesc}</p>
 
-                    <div className="space-y-2">
+                    <div className="space-y-1">
                       <SettingRow
                         theme={theme}
                         label={t.screenshotShortcut}
@@ -569,9 +565,7 @@ export default function DesktopEnvironment() {
                             onChange={setScreenshotShortcutInput}
                             onSave={() => void saveShortcut('screenshot', screenshotShortcutInput)}
                             saveLabel={shortcutSaving === 'screenshot' ? t.loading : t.save}
-                            recordLabel={t.shortcutRecord}
                             recordingLabel={t.shortcutRecording}
-                            doubleCommandLabel={t.shortcutDoubleCommand}
                             clearLabel={t.shortcutClear}
                           />
                         }
@@ -589,9 +583,7 @@ export default function DesktopEnvironment() {
                             onChange={setToggleShortcutInput}
                             onSave={() => void saveShortcut('toggle_window', toggleShortcutInput)}
                             saveLabel={shortcutSaving === 'toggle_window' ? t.loading : t.save}
-                            recordLabel={t.shortcutRecord}
                             recordingLabel={t.shortcutRecording}
-                            doubleCommandLabel={t.shortcutDoubleCommand}
                             clearLabel={t.shortcutClear}
                           />
                         }
@@ -600,7 +592,7 @@ export default function DesktopEnvironment() {
                   </div>
 
                   <div
-                    className={`rounded-xl border p-4 ${
+                    className={`rounded-xl border p-3 ${
                       theme === 'dark' ? 'border-gray-800 bg-gray-950/50' : 'border-gray-100 bg-gray-50'
                     }`}
                   >
@@ -707,9 +699,9 @@ function SettingRow({
   control: ReactNode;
 }) {
   return (
-    <div className={`flex items-center justify-between border-b py-3 ${theme === 'dark' ? 'border-gray-800' : 'border-gray-100'}`}>
-      <div>
-        <span className="text-sm font-medium tracking-tight">{label}</span>
+    <div className={`flex items-center justify-between gap-3 border-b py-1 ${theme === 'dark' ? 'border-gray-800' : 'border-gray-100'}`}>
+      <div className="min-w-0">
+        <span className="block text-sm font-medium leading-4 tracking-tight">{label}</span>
         {description ? <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{description}</p> : null}
       </div>
       {control}
@@ -744,9 +736,7 @@ function ShortcutInput({
   value,
   placeholder,
   saveLabel,
-  recordLabel,
   recordingLabel,
-  doubleCommandLabel,
   clearLabel,
   disabled,
   onChange,
@@ -756,9 +746,7 @@ function ShortcutInput({
   value: string;
   placeholder: string;
   saveLabel: string;
-  recordLabel: string;
   recordingLabel: string;
-  doubleCommandLabel: string;
   clearLabel: string;
   disabled?: boolean;
   onChange: (value: string) => void;
@@ -808,14 +796,14 @@ function ShortcutInput({
   };
 
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-1.5">
       <button
         ref={triggerRef}
         type="button"
         disabled={disabled}
         onClick={() => setIsRecording(true)}
         onKeyDown={captureShortcut}
-        className={`w-[180px] rounded-xl border px-3 py-2 text-left font-mono text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-teal-500 ${
+        className={`w-[188px] rounded-lg border px-2.5 py-1.5 text-left font-mono text-[11px] transition-colors focus:outline-none focus:ring-2 focus:ring-teal-500 ${
           theme === 'dark'
             ? 'border-gray-700 bg-gray-800 text-gray-100'
             : 'border-gray-200 bg-gray-50 text-gray-900'
@@ -825,40 +813,9 @@ function ShortcutInput({
       </button>
       <button
         type="button"
-        onClick={() => {
-          setIsRecording(true);
-          requestAnimationFrame(() => triggerRef.current?.focus());
-        }}
-        disabled={disabled}
-        className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
-          disabled
-            ? 'cursor-not-allowed bg-gray-400/40 text-white'
-            : theme === 'dark'
-              ? 'bg-white/10 text-white hover:bg-white/15'
-              : 'bg-black/10 text-gray-900 hover:bg-black/15'
-        }`}
-      >
-        {recordLabel}
-      </button>
-      <button
-        type="button"
-        onClick={() => onChange('DoubleCommand')}
-        disabled={disabled}
-        className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
-          disabled
-            ? 'cursor-not-allowed bg-gray-400/40 text-white'
-            : theme === 'dark'
-              ? 'bg-white/10 text-white hover:bg-white/15'
-              : 'bg-black/10 text-gray-900 hover:bg-black/15'
-        }`}
-      >
-        {doubleCommandLabel}
-      </button>
-      <button
-        type="button"
         onClick={() => onChange('')}
         disabled={disabled}
-        className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+        className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
           disabled
             ? 'cursor-not-allowed bg-gray-400/40 text-white'
             : theme === 'dark'
@@ -872,7 +829,7 @@ function ShortcutInput({
         type="button"
         onClick={onSave}
         disabled={disabled}
-        className={`rounded-xl px-3 py-2 text-xs font-medium transition-colors ${
+        className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
           disabled
             ? 'cursor-not-allowed bg-teal-500/50 text-white'
             : 'bg-teal-500 text-white hover:bg-teal-600'

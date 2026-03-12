@@ -25,4 +25,3 @@ uuid = { version = "1", features = ["v4"] }  # 生成唯一 ID
 chrono = { version = "0.4", features = ["serde"] }  # 时间处理
 image = "0.25"  # 图片处理
 base64 = "0.22"  # Base64 编码
-rdev = "0.5.3"
