@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.11.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build release bundle
+        run: pnpm bundle
+
+      - name: Zip macOS app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            src-tauri/target/release/bundle/macos/PPaste.app \
+            src-tauri/target/release/bundle/macos/PPaste.app.zip
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: .github/release-notes/${{ github.ref_name }}.md
+          files: |
+            src-tauri/target/release/bundle/macos/PPaste.app.zip
+            src-tauri/target/release/bundle/dmg/PPaste_*.dmg
