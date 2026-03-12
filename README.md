@@ -1,194 +1,92 @@
-# PPaste
+# 📦 PPaste
 
-PPaste 是一个面向 macOS 和 Windows 的本地剪贴板工具。
-它常驻菜单栏或托盘，记录文本与图片剪贴板历史，并支持用全局快捷键快速唤起，再将选中的内容直接粘贴回当前输入位置。
+**Your Clipboard, Infinite Memory. (你的剪贴板，无限记忆。)**
 
-## 适用人群
+## 💡 为什么需要 PPaste？
 
-- 经常在聊天、文档、代码编辑器之间复制粘贴的用户
-- 希望用键盘和菜单栏快速调用剪贴板历史的用户
-- 需要一个本地运行、不依赖云同步的轻量工具的用户
+市面上已经有了 Paste、Maccy，为什么还要造轮子？
+因为作为重度键盘用户和开发者，我们真正需要的是：
 
-## 核心能力
+1. **绝对的肌肉记忆：** 不想去记复杂的快捷键组合（`Option+Shift+C` 是什么鬼？）。**连按两次 `Command` 键**，这才是最符合直觉的零摩擦唤起方式。
+2. **拒绝“阅后即焚”：** 大多数工具只能存最近 100 条。PPaste 基于 SQLite 构建，致力于做你剪贴板的**永久时光机**，几个月前复制的一段 JSON 也能秒速搜出。
+3. **数据主权归你：** 你的复制历史是你“第二大脑”的碎片。PPaste 拒绝数据锁死，原生支持**将历史记录导出为结构化 JSON**，方便你导入 Notion、Obsidian 或喂给 AI 进行分析。
 
-- 自动记录剪贴板历史
-- 点击文本记录后直接粘贴到当前输入位置
-- 支持图片剪贴板预览与保存
-- 支持菜单栏或托盘、Dock 或任务栏、全局快捷键唤起窗口
-- 支持自定义显示快捷键
-- 所有数据保存在本机
+## ✨ 核心特性
 
-## 安装
+* **⚡️ 闪电唤起 (Zero-Friction Trigger)**
+* 全局双击 `⌘ Command` 即可呼出，用完即走，绝不打断心流。
 
-### 直接安装应用
 
-macOS：
+* **♾️ 无限持久化 (Infinite Storage)**
+* 底层采用高性能 SQLite 驱动，存上万条记录依然保持毫秒级检索。
 
-1. 打开 `PPaste.app`
-2. 将应用拖入 `Applications`
-3. 首次启动后按系统提示授予权限
 
-Windows：
+* **🔍 全文极速检索 (Blazing Fast Search)**
+* 支持对历史记录的文本进行模糊匹配，支持按来源 App 过滤。
 
-1. 运行打包生成的 `PPaste.exe` 或安装包
-2. 首次启动后允许应用访问剪贴板
-3. 如果要使用自动粘贴，确保系统没有拦截模拟按键
 
-### 从源码运行
+* **🛡️ 隐私至上 (Privacy First)**
+* 数据 100% 存在本地。
+* **智能黑名单**：自动忽略来自 1Password、Keychain 等密码管理软件的复制操作，保护你的敏感信息。
+
+
+* **📦 数据自由 (Data Freedom)**
+* 一键将你的剪贴板历史导出为标准 `.json` 文件。
+
+## 🚀 安装指南
+
+### 方法一：下载预编译版本 (推荐)
+
+1. 前往 [Releases](https://www.google.com/search?q=https://github.com/yyin9116/PPaste/releases) 页面。
+2. 下载最新版本的 `PPaste.dmg` 或 `PPaste.zip`。
+3. 拖入 `Applications` (应用程序) 文件夹。
+4. 首次运行请在系统设置中授予**“辅助功能 (Accessibility)”**权限（用于监听全局双击动作）。
+
+### 方法二：自行编译
 
 ```bash
-pnpm install
-pnpm tauri dev
+git clone https://github.com/yyin9116/PPaste.git
+cd PPaste
+# 双击打开 PPaste.xcodeproj，使用 Xcode 编译运行
 ```
 
-### 从源码打包
+## ⌨️ 快捷键速查表
 
-```bash
-pnpm install
-pnpm bundle
+在 PPaste 界面激活时，你可以完全丢掉鼠标：
+
+| 快捷键 | 动作 | 说明 |
+| --- | --- | --- |
+| `双击 ⌘ Cmd` | **唤起 PPaste** | 任何界面全局生效 |
+| `↑` / `↓` | 导航列表 | 切换选中的剪贴板记录 |
+| `Enter` | **粘贴** | 自动将当前内容粘贴到你上一个工作的窗口 |
+| `⌘ + C` | 仅复制 | 放入系统剪贴板但不执行粘贴动作 |
+| `Delete` | 永久删除 | 清除该条历史记录 |
+| `Esc` | 隐藏窗口 | 立即退出当前界面 |
+
+## 🛠 数据导出 (JSON) 示例
+
+导出的数据拥有极高的结构化程度，方便开发者二次利用：
+
+```json
+{
+  "total": 1250,
+  "export_date": "2026-03-12T10:00:00Z",
+  "records": [
+    {
+      "id": "A1B2C3D4...",
+      "timestamp": "2026-03-12T09:15:22Z",
+      "type": "text/plain",
+      "content": "function initDatabase() { ... }",
+      "source_app": "com.microsoft.VSCode"
+    }
+  ]
+}
 ```
 
-打包产物默认位于：
+## 🤝 参与贡献
 
-- `src-tauri/target/release/bundle/macos/PPaste.app`
-- `src-tauri/target/release/bundle/dmg/PPaste_0.0.1_aarch64.dmg`
-- Windows 在 Windows 主机上打包时会输出到 `src-tauri/target/release/bundle/msi` 或 `nsis`
+欢迎提交 PR 或 Issue！如果 PPaste 提升了你的效率，欢迎点个 ⭐️ Star 让更多人看到。
 
-## 首次启动
+## 📜 开源协议
 
-首次启动后，建议按下面顺序完成配置：
-
-1. 启动 PPaste
-2. 根据系统授权 PPaste 访问剪贴板和必要的辅助能力
-3. 如果要正常读取剪贴板历史，允许 PPaste 在前台读取剪贴板
-4. 打开设置页，确认唤起快捷键
-
-如果系统阻止模拟粘贴，PPaste 可以显示历史，但无法把选中内容自动粘贴回当前输入框。
-
-## 日常使用
-
-### 打开 PPaste
-
-可以通过以下任一方式打开主窗口：
-
-- 点击菜单栏或托盘图标
-- 点击 Dock 或任务栏中的应用图标
-- 使用全局快捷键
-
-### 选择并粘贴一条记录
-
-1. 先把光标放到你要输入的文本框、编辑器或聊天窗口
-2. 唤起 PPaste
-3. 点击一条文本记录
-
-PPaste 会自动：
-
-1. 将该条内容写入系统剪贴板
-2. 关闭自身窗口
-3. 向当前前台应用发送一次粘贴操作
-
-macOS 默认发送 `Command + V`。
-Windows 默认发送 `Ctrl + V`。
-
-### 搜索历史
-
-在主窗口顶部搜索框中输入关键字即可过滤历史记录。
-
-### 键盘操作
-
-- `ArrowUp` / `ArrowDown`：移动选择
-- `Enter`：复制或粘贴当前选中项
-- `Escape`：关闭设置层
-- macOS: `Command + ,` 打开设置
-
-## 设置说明
-
-### 主题
-
-支持浅色与深色主题。
-
-### 语言
-
-支持中文与英文界面。
-
-### 开机启动
-
-开启后，系统登录时自动启动 PPaste。
-
-### 快捷键绑定
-
-PPaste 的快捷键绑定不是手动输入字符串，而是直接录制按键：
-
-1. 点击当前快捷键显示区域
-2. 直接按下你想绑定的组合键
-3. 点击“保存”
-
-### 数据状态
-
-设置页会显示：
-
-- 当前记录总数
-- 数据库大小
-- 本地数据库路径
-
-## 权限说明
-
-### 辅助功能或自动化权限
-
-用于：
-
-- 将选中的文本自动粘贴回当前前台应用
-
-### 剪贴板访问
-
-用于：
-
-- 读取新的文本或图片剪贴板内容
-- 维护历史记录
-
-## 数据存储
-
-PPaste 默认把数据保存在本机：
-
-- 数据目录：`~/Library/Application Support/ppaste`
-- 数据库：`~/Library/Application Support/ppaste/clips.db`
-
-如果检测到旧版本 `clipspace` 数据目录，PPaste 会在启动时自动迁移到新目录。
-
-## 常见问题
-
-### 点击记录后没有自动粘贴
-
-优先检查：
-
-1. 是否已授予系统所需权限
-2. 当前前台应用是否允许粘贴快捷键
-3. 选中的是否为文本记录
-
-### 历史为空
-
-优先检查：
-
-1. 是否真的复制过新内容
-2. PPaste 是否处于暂停状态
-3. 系统是否阻止了应用访问剪贴板
-
-### 菜单栏或 Dock 点击无法唤起
-
-先完全退出 PPaste，再重新打开。
-如果仍然无效，重新安装最新版本并再次授权。
-
-## 开发检查
-
-```bash
-pnpm build
-cargo check --manifest-path src-tauri/Cargo.toml
-```
-
-## 发布说明
-
-`v0.0.1` 的 release note 位于：
-
-- `.github/release-notes/v0.0.1.md`
-
-GitHub Actions 会在推送 tag（如 `v0.0.1`）时自动打包并创建 release。
+本项目基于 [MIT License](https://www.google.com/search?q=LICENSE) 协议开源。
