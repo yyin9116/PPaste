@@ -3,7 +3,7 @@ use chrono::Utc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -454,9 +454,28 @@ fn paste_active_app() -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn paste_active_app() -> Result<(), String> {
-    Err("Direct paste is only implemented on macOS".to_string())
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$wshell = New-Object -ComObject WScript.Shell; Start-Sleep -Milliseconds 80; $wshell.SendKeys('^v')",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to execute paste shortcut: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn paste_active_app() -> Result<(), String> {
+    Err("Direct paste is only implemented on macOS and Windows".to_string())
 }
 
 fn apply_toggle_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: String) -> Result<(), String> {
