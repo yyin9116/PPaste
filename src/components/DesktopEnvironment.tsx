@@ -5,6 +5,8 @@ import {
   ChevronDown,
   Database,
   Loader2,
+  Maximize2,
+  Pin,
   Search,
   Settings,
   Trash2,
@@ -14,6 +16,7 @@ import {
   clearAllClips,
   deleteClip,
   getClips,
+  getRunAtLogin,
   getSettings,
   getStats,
   listenToNewClip,
@@ -40,8 +43,91 @@ interface ClipView {
   content: string;
   preview?: string;
   type: BackendClip['clip_type'];
+  category?: string;
+  resolvedCategory?: string;
   source?: string;
   timestamp: number;
+  isPinned: boolean;
+}
+
+const PINNED_CLIPS_STORAGE_KEY = 'ppaste:pinned-clips';
+
+function inferDetailedCategory(content: string, type: BackendClip['clip_type']) {
+  if (type === 'image') return 'Image';
+  if (type === 'file') return 'File';
+
+  const trimmed = content.trim();
+  const lower = trimmed.toLowerCase();
+
+  if (/^https?:\/\//.test(trimmed)) return 'Links';
+
+  if ((trimmed.startsWith('{') || trimmed.startsWith('[')) && (() => {
+    try {
+      JSON.parse(trimmed);
+      return true;
+    } catch {
+      return false;
+    }
+  })()) {
+    return 'JSON';
+  }
+
+  if (
+    lower.includes('<!doctype html') ||
+    /<\/?[a-z][\s\S]*>/i.test(trimmed)
+  ) {
+    return 'HTML';
+  }
+
+  if (
+    trimmed.includes('```') ||
+    /^\s{0,3}(#{1,6}\s|\* |- |\d+\. |> )/m.test(trimmed) ||
+    /\[[^\]]+\]\([^)]+\)/.test(trimmed)
+  ) {
+    return 'Markdown';
+  }
+
+  if (
+    trimmed.includes('\n') &&
+    trimmed
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .every((line) => /^[\w"'`.-]+\s*:\s*.+$/.test(line.trim()))
+  ) {
+    return 'YAML';
+  }
+
+  if (/\b(select|insert into|update|delete from|create table|alter table|where)\b/i.test(trimmed)) {
+    return 'SQL';
+  }
+
+  if (
+    trimmed.startsWith('#!/bin/') ||
+    /^\$\s+\S+/m.test(trimmed) ||
+    /\b(export|sudo|cd|ls|mkdir|rm|cp|mv)\b/.test(lower)
+  ) {
+    return 'Shell';
+  }
+
+  if (/\b(fn|function|const|let|import|return|class|interface|type)\b/.test(trimmed) || trimmed.includes('=>')) {
+    return 'Code';
+  }
+
+  return 'Text';
+}
+
+function resolveClipCategory(clip: BackendClip) {
+  const inferred = inferDetailedCategory(clip.content, clip.clip_type);
+
+  if (!clip.category || clip.category === 'Text' || clip.category === 'Notes') {
+    return inferred;
+  }
+
+  if (clip.category === 'Code' && inferred !== 'Text' && inferred !== 'Code') {
+    return inferred;
+  }
+
+  return clip.category;
 }
 
 function mapClip(clip: BackendClip): ClipView {
@@ -53,9 +139,53 @@ function mapClip(clip: BackendClip): ClipView {
         ? `data:image/png;base64,${clip.content}`
         : clip.preview,
     type: clip.clip_type,
+    category: clip.category,
+    resolvedCategory: resolveClipCategory(clip),
     source: clip.source,
     timestamp: clip.timestamp,
+    isPinned: false,
   };
+}
+
+function sortClips(clips: ClipView[]) {
+  return [...clips].sort((a, b) => {
+    if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+    return b.timestamp - a.timestamp;
+  });
+}
+
+function getClipBadge(clip: ClipView, language: Language) {
+  const categoryMap: Record<string, { zh: string; en: string }> = {
+    Links: { zh: '链接', en: 'Link' },
+    JSON: { zh: 'JSON', en: 'JSON' },
+    HTML: { zh: 'HTML', en: 'HTML' },
+    Markdown: { zh: 'Markdown', en: 'Markdown' },
+    YAML: { zh: 'YAML', en: 'YAML' },
+    SQL: { zh: 'SQL', en: 'SQL' },
+    Shell: { zh: 'Shell', en: 'Shell' },
+    Code: { zh: '代码', en: 'Code' },
+    Text: { zh: '文本', en: 'Text' },
+    Notes: { zh: '文本', en: 'Text' },
+    Image: { zh: '图片', en: 'Image' },
+    File: { zh: '文件', en: 'File' },
+  };
+  const localizedCategory = clip.resolvedCategory ? categoryMap[clip.resolvedCategory]?.[language] ?? clip.resolvedCategory : null;
+
+  if (localizedCategory) return localizedCategory;
+
+  if (clip.source && clip.source.trim() && clip.source.trim().toLowerCase() !== 'unknown') {
+    return clip.source;
+  }
+
+  if (clip.type === 'image') {
+    return language === 'zh' ? '图片' : 'Image';
+  }
+
+  if (clip.type === 'file') {
+    return language === 'zh' ? '文件' : 'File';
+  }
+
+  return language === 'zh' ? '文本' : 'Text';
 }
 
 function formatRelativeTime(timestamp: number, language: Language) {
@@ -76,11 +206,23 @@ export default function DesktopEnvironment() {
   const [settingsData, setSettingsData] = useState<BackendSettings | null>(null);
 
   const [clips, setClips] = useState<ClipView[]>([]);
+  const [pinnedClipIds, setPinnedClipIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(PINNED_CLIPS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+    } catch {
+      return [];
+    }
+  });
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const [hoveredClipId, setHoveredClipId] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState<'keyboard' | 'mouse' | null>(null);
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [showConfirmClear, setShowConfirmClear] = useState(false);
+  const [expandedClip, setExpandedClip] = useState<ClipView | null>(null);
 
   const [stats, setStats] = useState<ClipStats | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -99,6 +241,8 @@ export default function DesktopEnvironment() {
           copied: '已复制到系统剪贴板',
           pasted: '已粘贴到当前输入位置',
           deleted: '已删除记录',
+          pinned: '已置顶',
+          unpinned: '已取消置顶',
           cleared: '已清空历史',
           failed: '操作失败，请重试',
           loading: '同步中...',
@@ -131,6 +275,9 @@ export default function DesktopEnvironment() {
           confirm: '确认清空',
           cancel: '取消',
           close: '关闭',
+          preview: '查看全文',
+          pin: '置顶',
+          unpin: '取消置顶',
         }
       : {
           title: 'PPaste',
@@ -140,6 +287,8 @@ export default function DesktopEnvironment() {
           copied: 'Copied to system clipboard',
           pasted: 'Pasted into the active field',
           deleted: 'Clip deleted',
+          pinned: 'Pinned',
+          unpinned: 'Unpinned',
           cleared: 'History cleared',
           failed: 'Action failed',
           loading: 'Syncing...',
@@ -172,6 +321,9 @@ export default function DesktopEnvironment() {
           confirm: 'Confirm',
           cancel: 'Cancel',
           close: 'Close',
+          preview: 'Open',
+          pin: 'Pin',
+          unpin: 'Unpin',
         };
 
   const themeOptions: SelectOption[] = [
@@ -188,6 +340,33 @@ export default function DesktopEnvironment() {
     const q = query.trim().toLowerCase();
     return clips.filter((c) => q.length === 0 || c.content.toLowerCase().includes(q) || c.source?.toLowerCase().includes(q));
   }, [clips, query]);
+
+  const playFeedbackTone = async () => {
+    if (!settingsData?.play_sounds) return;
+
+    const AudioContextCtor = window.AudioContext ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) return;
+
+    const context = new AudioContextCtor();
+    if (context.state === 'suspended') {
+      await context.resume();
+    }
+
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = 'sine';
+    oscillator.frequency.value = 920;
+    gain.gain.setValueAtTime(0.0001, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.05, context.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.12);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.12);
+    oscillator.onended = () => {
+      void context.close();
+    };
+  };
 
   const showToast = (message: string) => {
     setToast(message);
@@ -206,17 +385,37 @@ export default function DesktopEnvironment() {
     const silent = options?.silent ?? false;
     try {
       if (!silent) setIsSyncing(true);
-      const [clipRows, settingsRows] = await Promise.all([getClips(200, 0), getSettings()]);
-      setClips(clipRows.map(mapClip));
-      setSettingsData(settingsRows);
-      setTheme((settingsRows.theme as ThemeMode) || 'dark');
-      setLanguage((settingsRows.language as Language) || 'zh');
+      const [clipRows, settingsRows, runAtLoginEnabled] = await Promise.all([getClips(200, 0), getSettings(), getRunAtLogin()]);
+      const effectiveSettings = { ...settingsRows, launch_at_login: runAtLoginEnabled };
+      setClips(
+        sortClips(
+          clipRows.map((clip) => ({
+            ...mapClip(clip),
+            isPinned: pinnedClipIds.includes(clip.id),
+          })),
+        ),
+      );
+      setSettingsData(effectiveSettings);
+      setTheme((effectiveSettings.theme as ThemeMode) || 'dark');
+      setLanguage((effectiveSettings.language as Language) || 'zh');
     } catch (e) {
       console.error(e);
     } finally {
       if (!silent) setIsSyncing(false);
     }
   };
+
+  useEffect(() => {
+    localStorage.setItem(PINNED_CLIPS_STORAGE_KEY, JSON.stringify(pinnedClipIds));
+    setClips((prev) =>
+      sortClips(
+        prev.map((clip) => ({
+          ...clip,
+          isPinned: pinnedClipIds.includes(clip.id),
+        })),
+      ),
+    );
+  }, [pinnedClipIds]);
 
   const patchSettings = async (next: Partial<BackendSettings>) => {
     if (!settingsData) return;
@@ -261,9 +460,11 @@ export default function DesktopEnvironment() {
     try {
       if (clip.type === 'text') {
         await pasteClip(clip.content, clip.type);
+        await playFeedbackTone();
         showToast(t.pasted);
       } else {
         await writeToClipboard(clip.content, clip.type);
+        await playFeedbackTone();
         showToast(t.copied);
       }
     } catch (e) {
@@ -272,15 +473,27 @@ export default function DesktopEnvironment() {
     }
   };
 
+  const canExpandClip = (clip: ClipView) =>
+    clip.type === 'image' || (clip.type === 'text' && (clip.content.length > 120 || clip.content.includes('\n')));
+
   const removeClip = async (id: string) => {
     try {
       await deleteClip(id);
       setClips((prev) => prev.filter((x) => x.id !== id));
+      setPinnedClipIds((prev) => prev.filter((pinnedId) => pinnedId !== id));
       showToast(t.deleted);
     } catch (e) {
       console.error(e);
       showToast(t.failed);
     }
+  };
+
+  const togglePinned = (clip: ClipView) => {
+    const nextPinned = !clip.isPinned;
+    setPinnedClipIds((prev) =>
+      nextPinned ? [clip.id, ...prev.filter((id) => id !== clip.id)] : prev.filter((id) => id !== clip.id),
+    );
+    showToast(nextPinned ? t.pinned : t.unpinned);
   };
 
   useEffect(() => {
@@ -295,14 +508,20 @@ export default function DesktopEnvironment() {
     const unlistenPromise = listenToNewClip((clip) => {
       setClips((prev) => {
         if (prev.some((x) => x.id === clip.id)) return prev;
-        return [mapClip(clip), ...prev].slice(0, 500);
+        return sortClips([
+          {
+            ...mapClip(clip),
+            isPinned: pinnedClipIds.includes(clip.id),
+          },
+          ...prev,
+        ]).slice(0, 500);
       });
     });
     return () => {
       clearInterval(interval);
       void unlistenPromise.then((u) => u());
     };
-  }, []);
+  }, [pinnedClipIds]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -319,10 +538,14 @@ export default function DesktopEnvironment() {
       if (isSettingsOpen) return;
       if (event.key === 'ArrowDown') {
         event.preventDefault();
+        setSelectionMode('keyboard');
+        setHoveredClipId(null);
         setSelectedIndex((prev) => Math.min(prev + 1, Math.max(filtered.length - 1, 0)));
       }
       if (event.key === 'ArrowUp') {
         event.preventDefault();
+        setSelectionMode('keyboard');
+        setHoveredClipId(null);
         setSelectedIndex((prev) => Math.max(prev - 1, 0));
       }
       if (event.key === 'Enter') {
@@ -396,7 +619,13 @@ export default function DesktopEnvironment() {
             </div>
           </div>
 
-          <div className="custom-scrollbar flex-1 space-y-1 overflow-y-auto p-2">
+          <div
+            className="custom-scrollbar flex-1 space-y-1 overflow-y-auto p-2"
+            onMouseLeave={() => {
+              setHoveredClipId(null);
+              if (selectionMode === 'mouse') setSelectionMode(null);
+            }}
+          >
             {clips.length === 0 && isSyncing ? (
               <div className="flex items-center justify-center gap-2 py-16 text-sm text-gray-400">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -412,10 +641,13 @@ export default function DesktopEnvironment() {
               filtered.map((clip, index) => (
                 <div
                   key={clip.id}
-                  onMouseEnter={() => setSelectedIndex(index)}
+                  onMouseEnter={() => {
+                    setHoveredClipId(clip.id);
+                    setSelectionMode('mouse');
+                  }}
                   onClick={() => void copyClip(clip)}
                   className={`group flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 transition-all ${
-                    index === selectedIndex
+                    hoveredClipId === clip.id || (selectionMode === 'keyboard' && index === selectedIndex)
                       ? theme === 'dark'
                         ? 'bg-teal-500/15 text-white'
                         : 'bg-teal-500/10 text-teal-900'
@@ -439,11 +671,51 @@ export default function DesktopEnvironment() {
                       <span className="block truncate">{clip.content.split('\n')[0] || clip.content}</span>
                     )}
                     <div className="mt-0.5 flex items-center gap-2 text-[10px] text-gray-500">
-                      <span>{clip.source || 'Unknown'}</span>
+                      <span>{getClipBadge(clip, language)}</span>
+                      {clip.isPinned ? (
+                        <>
+                          <span>•</span>
+                          <span>{language === 'zh' ? '置顶' : 'Pinned'}</span>
+                        </>
+                      ) : null}
                       <span>•</span>
                       <span>{formatRelativeTime(clip.timestamp, language)}</span>
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    title={clip.isPinned ? t.unpin : t.pin}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      togglePinned(clip);
+                    }}
+                    className={`rounded-lg p-1.5 transition-colors ${
+                      clip.isPinned
+                        ? theme === 'dark'
+                          ? 'text-teal-300 hover:bg-teal-500/20'
+                          : 'text-teal-700 hover:bg-teal-100'
+                        : theme === 'dark'
+                          ? 'hover:bg-white/10 hover:text-white'
+                          : 'hover:bg-black/10 hover:text-gray-900'
+                    }`}
+                  >
+                    <Pin className={`h-4 w-4 ${clip.isPinned ? 'fill-current' : ''}`} />
+                  </button>
+                  {canExpandClip(clip) ? (
+                    <button
+                      type="button"
+                      title={t.preview}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setExpandedClip(clip);
+                      }}
+                      className={`rounded-lg p-1.5 transition-colors ${
+                        theme === 'dark' ? 'hover:bg-white/10 hover:text-white' : 'hover:bg-black/10 hover:text-gray-900'
+                      }`}
+                    >
+                      <Maximize2 className="h-4 w-4" />
+                    </button>
+                  ) : null}
                   <button
                     onClick={(event) => {
                       event.stopPropagation();
@@ -461,6 +733,65 @@ export default function DesktopEnvironment() {
           </div>
         </div>
       </div>
+
+      <AnimatePresence>
+        {expandedClip && (
+          <motion.div
+            className="absolute inset-0 z-30 bg-black/30 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setExpandedClip(null)}
+          >
+            <motion.div
+              initial={{ opacity: 0, y: 10, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.98 }}
+              transition={{ duration: 0.15 }}
+              onClick={(event) => event.stopPropagation()}
+              className={`absolute left-4 right-4 top-4 bottom-4 flex flex-col overflow-hidden rounded-2xl border ${
+                theme === 'dark' ? 'border-gray-800 bg-gray-950' : 'border-gray-200 bg-white'
+              }`}
+            >
+              <div className={`flex items-center justify-between border-b px-4 py-3 ${theme === 'dark' ? 'border-gray-800' : 'border-gray-100'}`}>
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold tracking-tight">{getClipBadge(expandedClip, language)}</div>
+                  <div className="mt-1 text-xs text-gray-500">{formatRelativeTime(expandedClip.timestamp, language)}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setExpandedClip(null)}
+                  className={`rounded-lg p-2 transition-colors ${
+                    theme === 'dark' ? 'hover:bg-white/10' : 'hover:bg-black/10'
+                  }`}
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="custom-scrollbar flex-1 overflow-auto p-4">
+                {expandedClip.type === 'image' && expandedClip.preview ? (
+                  <div className="flex h-full items-center justify-center">
+                    <img
+                      src={expandedClip.preview}
+                      alt="clip preview"
+                      className="max-h-full max-w-full rounded-xl border border-white/10 object-contain shadow-2xl"
+                      referrerPolicy="no-referrer"
+                    />
+                  </div>
+                ) : (
+                  <pre
+                    className={`whitespace-pre-wrap break-words text-xs leading-6 ${
+                      theme === 'dark' ? 'text-gray-100' : 'text-gray-900'
+                    }`}
+                  >
+                    {expandedClip.content}
+                  </pre>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {isSettingsOpen && (
@@ -488,8 +819,8 @@ export default function DesktopEnvironment() {
                 </button>
               </div>
 
-              <div className="custom-scrollbar flex-1 overflow-y-auto p-6">
-                <div className="space-y-4">
+              <div className="custom-scrollbar flex-1 overflow-y-auto px-4 pb-4 pt-3">
+                <div className="space-y-2">
                   <SettingRow
                     theme={theme}
                     label={t.theme}
@@ -699,9 +1030,13 @@ function SettingRow({
   control: ReactNode;
 }) {
   return (
-    <div className={`flex items-center justify-between gap-3 border-b py-1 ${theme === 'dark' ? 'border-gray-800' : 'border-gray-100'}`}>
+    <div
+      className={`flex justify-between gap-3 border-b ${description ? 'items-start py-1' : 'items-center py-0.5'} ${
+        theme === 'dark' ? 'border-gray-800' : 'border-gray-100'
+      }`}
+    >
       <div className="min-w-0">
-        <span className="block text-sm font-medium leading-4 tracking-tight">{label}</span>
+        <span className={`block text-sm font-medium tracking-tight ${description ? 'leading-4' : 'leading-7'}`}>{label}</span>
         {description ? <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{description}</p> : null}
       </div>
       {control}
@@ -890,12 +1225,12 @@ function FlatSelect({
     <div ref={rootRef} className="relative">
       <button
         onClick={() => setOpen((prev) => !prev)}
-        className={`flex min-w-[120px] items-center justify-between rounded-xl border px-3 py-2 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-teal-500 ${
+        className={`flex h-7 min-w-[100px] items-center justify-between rounded-md border px-2 text-xs leading-4 transition-colors focus:outline-none focus:ring-2 focus:ring-teal-500 ${
           theme === 'dark' ? 'border-gray-700 bg-gray-800 text-gray-100 hover:bg-gray-700' : 'border-gray-200 bg-gray-50 text-gray-900 hover:bg-gray-100'
         }`}
       >
         <span>{current?.label}</span>
-        <ChevronDown className={`h-4 w-4 transition-transform ${open ? 'rotate-180' : ''}`} />
+        <ChevronDown className={`h-3.5 w-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
 
       <AnimatePresence>
@@ -916,7 +1251,7 @@ function FlatSelect({
                   onChange(opt.value);
                   setOpen(false);
                 }}
-                className={`flex w-full items-center justify-between px-3 py-2 text-left text-sm transition-colors ${
+                className={`flex w-full items-center justify-between px-2.5 py-1.5 text-left text-xs leading-4 transition-colors ${
                   value === opt.value
                     ? 'bg-teal-500 text-white'
                     : theme === 'dark'

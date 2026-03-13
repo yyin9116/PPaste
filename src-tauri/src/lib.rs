@@ -1,14 +1,16 @@
-use arboard::Clipboard;
+use arboard::{Clipboard, ImageData};
 use chrono::Utc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::borrow::Cow;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -82,7 +84,8 @@ pub struct AppState {
     pub suppressed_text: Arc<Mutex<Option<String>>>,
     pub last_image_hash: Arc<Mutex<Option<u64>>>, // 图片去重
     pub active_toggle_shortcut: Arc<Mutex<String>>,
-    pub ignore_focus_loss_until: Arc<Mutex<Option<Instant>>>,
+    pub awaiting_focus_after_show: Arc<Mutex<bool>>,
+    pub last_frontmost_app: Arc<Mutex<Option<String>>>,
 }
 
 // --- 数据库初始化 ---
@@ -170,6 +173,34 @@ fn migrate_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn persist_settings(conn: &Connection, settings: &Settings) -> Result<(), String> {
+    let serialized = serde_json::to_string(settings).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params!["app_settings", serialized],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_settings(conn: &Connection) -> Settings {
+    let stored = conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params!["app_settings"],
+        |row| row.get::<_, String>(0),
+    );
+
+    match stored {
+        Ok(value) => serde_json::from_str::<Settings>(&value).unwrap_or_else(|_| Settings::default()),
+        Err(_) => {
+            let defaults = Settings::default();
+            let _ = persist_settings(conn, &defaults);
+            defaults
+        }
+    }
+}
+
 // --- 存储路径管理 ---
 
 fn ensure_storage_dir(storage_path: &str) -> Result<String, String> {
@@ -183,6 +214,15 @@ fn save_image_to_storage(storage_path: &str, image_data: &[u8], clip_id: &str) -
     let file_path = std::path::Path::new(storage_path).join(format!("{}.png", clip_id));
     std::fs::write(&file_path, image_data).map_err(|e| format!("Failed to save image: {}", e))?;
     Ok(file_path.to_string_lossy().to_string())
+}
+
+fn decode_image_clip(content: &str) -> Result<(Vec<u8>, usize, usize), String> {
+    let png_bytes = BASE64.decode(content).map_err(|e| format!("Failed to decode image data: {}", e))?;
+    let image = image::load_from_memory(&png_bytes)
+        .map_err(|e| format!("Failed to parse image data: {}", e))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    Ok((image.into_raw(), width as usize, height as usize))
 }
 
 // --- 剪贴板监控 ---
@@ -379,17 +419,87 @@ fn save_clip_with_path(
 }
 
 fn detect_category(content: &str) -> Option<String> {
-    if content.starts_with("http://") || content.starts_with("https://") {
+    let trimmed = content.trim();
+    let lower = trimmed.to_lowercase();
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return Some("Links".to_string());
     }
-    if content.contains("fn ") || content.contains("function ") || 
-       content.contains("const ") || content.contains("let ") ||
-       content.contains("import ") || content.contains("return ") {
+
+    if matches!(trimmed.chars().next(), Some('{') | Some('[')) && serde_json::from_str::<Value>(trimmed).is_ok() {
+        return Some("JSON".to_string());
+    }
+
+    if lower.contains("<!doctype html")
+        || lower.contains("<html")
+        || lower.contains("<body")
+        || lower.contains("<div")
+        || lower.contains("<span")
+        || lower.contains("<p>")
+    {
+        return Some("HTML".to_string());
+    }
+
+    if trimmed.contains("```")
+        || trimmed.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("# ")
+                || line.starts_with("## ")
+                || line.starts_with("- ")
+                || line.starts_with("* ")
+                || line.starts_with("> ")
+                || line.starts_with("- [")
+                || line.starts_with("* [")
+        })
+        || (trimmed.contains('[') && trimmed.contains("]("))
+    {
+        return Some("Markdown".to_string());
+    }
+
+    if trimmed.lines().count() > 1
+        && trimmed.lines().all(|line| {
+            let line = line.trim();
+            line.is_empty() || (line.contains(':') && !line.contains('{') && !line.contains('}'))
+        })
+    {
+        return Some("YAML".to_string());
+    }
+
+    if lower.contains("select ")
+        || lower.contains("insert into ")
+        || lower.contains("update ")
+        || lower.contains("delete from ")
+        || lower.contains("create table ")
+    {
+        return Some("SQL".to_string());
+    }
+
+    if trimmed.starts_with("#!/bin/")
+        || trimmed.starts_with("$ ")
+        || lower.contains(" && ")
+        || lower.contains(" | ")
+        || lower.contains("export ")
+        || lower.contains("sudo ")
+    {
+        return Some("Shell".to_string());
+    }
+
+    if content.contains("fn ")
+        || content.contains("function ")
+        || content.contains("const ")
+        || content.contains("let ")
+        || content.contains("import ")
+        || content.contains("return ")
+        || content.contains("class ")
+        || content.contains("=>")
+    {
         return Some("Code".to_string());
     }
-    if content.len() < 100 && !content.contains('\n') {
-        return Some("Notes".to_string());
+
+    if trimmed.len() < 100 && !trimmed.contains('\n') {
+        return Some("Text".to_string());
     }
+
     None
 }
 
@@ -406,12 +516,20 @@ fn normalize_shortcut(input: &str) -> String {
 
 fn show_main_window(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        if let Some(bundle_id) = capture_frontmost_app_bundle_id() {
+            let mut last_frontmost_app = state.last_frontmost_app.lock().unwrap();
+            *last_frontmost_app = Some(bundle_id);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Regular)
         .map_err(|e| e.to_string())?;
 
     if let Some(state) = app.try_state::<Arc<AppState>>() {
-        let mut ignore_focus_loss_until = state.ignore_focus_loss_until.lock().unwrap();
-        *ignore_focus_loss_until = Some(Instant::now() + Duration::from_millis(350));
+        let mut awaiting_focus_after_show = state.awaiting_focus_after_show.lock().unwrap();
+        *awaiting_focus_after_show = true;
     }
 
     if let Some(window) = app.get_webview_window("main") {
@@ -421,6 +539,28 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn capture_frontmost_app_bundle_id() -> Option<String> {
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            r#"tell application "System Events" to get bundle identifier of first application process whose frontmost is true"#,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let bundle_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if bundle_id.is_empty() || bundle_id == "com.yinyin.ppaste" {
+        None
+    } else {
+        Some(bundle_id)
+    }
 }
 
 fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
@@ -436,14 +576,18 @@ fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn paste_active_app() -> Result<(), String> {
-    thread::sleep(Duration::from_millis(80));
+fn paste_active_app(target_bundle_id: Option<String>) -> Result<(), String> {
+    let mut script_lines = Vec::new();
+    if let Some(bundle_id) = target_bundle_id {
+        script_lines.push(format!(r#"tell application id "{}" to activate"#, bundle_id.replace('"', "\\\"")));
+        script_lines.push("delay 0.14".to_string());
+    } else {
+        script_lines.push("delay 0.08".to_string());
+    }
+    script_lines.push(r#"tell application "System Events" to keystroke "v" using command down"#.to_string());
 
     let output = Command::new("osascript")
-        .args([
-            "-e",
-            r#"tell application "System Events" to keystroke "v" using command down"#,
-        ])
+        .args(script_lines.iter().flat_map(|line| ["-e", line.as_str()]))
         .output()
         .map_err(|e| format!("Failed to execute paste shortcut: {}", e))?;
 
@@ -455,13 +599,13 @@ fn paste_active_app() -> Result<(), String> {
 }
 
 #[cfg(target_os = "windows")]
-fn paste_active_app() -> Result<(), String> {
+fn paste_active_app(_target_bundle_id: Option<String>) -> Result<(), String> {
     let output = Command::new("powershell")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$wshell = New-Object -ComObject WScript.Shell; Start-Sleep -Milliseconds 80; $wshell.SendKeys('^v')",
+            "$wshell = New-Object -ComObject WScript.Shell; Start-Sleep -Milliseconds 40; $wshell.SendKeys('^v')",
         ])
         .output()
         .map_err(|e| format!("Failed to execute paste shortcut: {}", e))?;
@@ -474,7 +618,7 @@ fn paste_active_app() -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn paste_active_app() -> Result<(), String> {
+fn paste_active_app(_target_bundle_id: Option<String>) -> Result<(), String> {
     Err("Direct paste is only implemented on macOS and Windows".to_string())
 }
 
@@ -511,7 +655,7 @@ fn apply_toggle_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: S
 fn get_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec<Clip> {
     let conn = state.db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, clip_type, category, content, preview, timestamp, source 
+        "SELECT id, clip_type, category, content, preview, timestamp, source
          FROM clips ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
     ).unwrap();
     
@@ -558,8 +702,28 @@ fn write_to_clipboard(state: tauri::State<Arc<AppState>>, content: String, clip_
         clipboard.set_text(&content).map_err(|e| e.to_string())?;
         let mut suppressed_text = state.suppressed_text.lock().unwrap();
         *suppressed_text = Some(content.clone());
+    } else if clip_type == "image" {
+        let (rgba, width, height) = decode_image_clip(&content)?;
+        clipboard
+            .set_image(ImageData {
+                width,
+                height,
+                bytes: Cow::Owned(rgba.clone()),
+            })
+            .map_err(|e| e.to_string())?;
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        rgba.hash(&mut hasher);
+        let image_hash = hasher.finish();
+        let mut last_image_hash = state.last_image_hash.lock().unwrap();
+        *last_image_hash = Some(image_hash);
     } else {
-        return Err("Only text clips can be copied right now".to_string());
+        clipboard.set_text(&content).map_err(|e| e.to_string())?;
+        let mut suppressed_text = state.suppressed_text.lock().unwrap();
+        *suppressed_text = Some(content.clone());
     }
 
     let mut last_clip = state.last_clip.lock().unwrap();
@@ -570,9 +734,15 @@ fn write_to_clipboard(state: tauri::State<Arc<AppState>>, content: String, clip_
 
 #[tauri::command]
 fn paste_clip(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, content: String, clip_type: String) -> Result<(), String> {
+    let target_bundle_id = state.last_frontmost_app.lock().unwrap().clone();
     write_to_clipboard(state, content, clip_type)?;
     hide_window(app)?;
-    paste_active_app()
+    thread::spawn(move || {
+        if let Err(err) = paste_active_app(target_bundle_id) {
+            eprintln!("Failed to paste into active app: {}", err);
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -582,59 +752,46 @@ fn get_settings(state: tauri::State<Arc<AppState>>) -> Settings {
 
 #[tauri::command]
 fn update_settings(state: tauri::State<Arc<AppState>>, settings: Settings) -> Result<(), String> {
-    let mut current_settings = state.settings.lock().unwrap();
-    
-    // 如果存储路径改变，确保新目录存在
-    if settings.storage_path != current_settings.storage_path {
-        ensure_storage_dir(&settings.storage_path)?;
-    }
-    
-    *current_settings = settings;
-    Ok(())
-}
-
-#[tauri::command]
-fn update_shortcut(
-    app: tauri::AppHandle,
-    state: tauri::State<Arc<AppState>>,
-    shortcut_type: String,
-    shortcut: String,
-) -> Result<(), String> {
-    let shortcut = shortcut.trim().to_string();
-    if shortcut.is_empty() {
-        return Err("Shortcut cannot be empty".to_string());
-    }
-
+    let next_settings = settings.clone();
     {
-        let mut settings = state.settings.lock().unwrap();
-        match shortcut_type.as_str() {
-            "screenshot" => settings.screenshot_shortcut = shortcut.clone(),
-            "toggle_window" => settings.toggle_window_shortcut = shortcut.clone(),
-            _ => return Err("Unknown shortcut type".to_string()),
+        let mut current_settings = state.settings.lock().unwrap();
+
+        // 如果存储路径改变，确保新目录存在
+        if settings.storage_path != current_settings.storage_path {
+            ensure_storage_dir(&settings.storage_path)?;
         }
+
+        *current_settings = settings;
     }
 
-    if shortcut_type == "toggle_window" {
-        apply_toggle_shortcut(&app, &state.inner().clone(), shortcut)?;
-    }
-
-    Ok(())
+    let conn = state.db.lock().unwrap();
+    persist_settings(&conn, &next_settings)
 }
 
 #[tauri::command]
 fn update_storage_path(state: tauri::State<Arc<AppState>>, path: String) -> Result<(), String> {
     ensure_storage_dir(&path)?;
-    
-    let mut settings = state.settings.lock().unwrap();
-    settings.storage_path = path;
-    
-    Ok(())
+
+    let next_settings = {
+        let mut settings = state.settings.lock().unwrap();
+        settings.storage_path = path;
+        settings.clone()
+    };
+
+    let conn = state.db.lock().unwrap();
+    persist_settings(&conn, &next_settings)
 }
 
 #[tauri::command]
 fn set_run_at_login(state: tauri::State<Arc<AppState>>, enabled: bool) -> Result<(), String> {
-    let mut settings = state.settings.lock().unwrap();
-    settings.launch_at_login = enabled;
+    let next_settings = {
+        let mut settings = state.settings.lock().unwrap();
+        settings.launch_at_login = enabled;
+        settings.clone()
+    };
+
+    let conn = state.db.lock().unwrap();
+    persist_settings(&conn, &next_settings)?;
     // 注意：实际实现需要使用 tauri-plugin-autostart
     Ok(())
 }
@@ -657,6 +814,35 @@ fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn show_window(app: tauri::AppHandle) -> Result<(), String> {
     show_main_window(&app)
+}
+#[tauri::command]
+fn update_shortcut(
+    app: tauri::AppHandle,
+    state: tauri::State<Arc<AppState>>,
+    shortcut_type: String,
+    shortcut: String,
+) -> Result<(), String> {
+    let shortcut = shortcut.trim().to_string();
+    if shortcut.is_empty() {
+        return Err("Shortcut cannot be empty".to_string());
+    }
+
+    let next_settings = {
+        let mut settings = state.settings.lock().unwrap();
+        match shortcut_type.as_str() {
+            "screenshot" => settings.screenshot_shortcut = shortcut.clone(),
+            "toggle_window" => settings.toggle_window_shortcut = shortcut.clone(),
+            _ => return Err("Unknown shortcut type".to_string()),
+        }
+        settings.clone()
+    };
+
+    if shortcut_type == "toggle_window" {
+        apply_toggle_shortcut(&app, &state.inner().clone(), shortcut)?;
+    }
+
+    let conn = state.db.lock().unwrap();
+    persist_settings(&conn, &next_settings)
 }
 
 // --- 截图和图片功能 ---
@@ -985,7 +1171,7 @@ pub fn run() {
     // 初始化数据库
     let conn = init_db(db_path.to_str().unwrap()).expect("Failed to initialize database");
     
-    let default_settings = Settings::default();
+    let default_settings = load_settings(&conn);
     let app_state = Arc::new(AppState {
         db: Arc::new(Mutex::new(conn)),
         settings: Arc::new(Mutex::new(default_settings.clone())),
@@ -994,12 +1180,17 @@ pub fn run() {
         suppressed_text: Arc::new(Mutex::new(None)),
         last_image_hash: Arc::new(Mutex::new(None)),
         active_toggle_shortcut: Arc::new(Mutex::new(default_settings.toggle_window_shortcut.clone())),
-        ignore_focus_loss_until: Arc::new(Mutex::new(None)),
+        awaiting_focus_after_show: Arc::new(Mutex::new(false)),
+        last_frontmost_app: Arc::new(Mutex::new(None)),
     });
     
     // 剪贴板监控在 setup 后启动
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(app_state.clone())
@@ -1084,16 +1275,20 @@ pub fn run() {
                 return;
             }
 
+            if let WindowEvent::Focused(true) = event {
+                if let Some(state) = window.try_state::<Arc<AppState>>() {
+                    let mut awaiting_focus_after_show = state.awaiting_focus_after_show.lock().unwrap();
+                    *awaiting_focus_after_show = false;
+                }
+                return;
+            }
+
             if let WindowEvent::Focused(false) = event {
                 if let Some(state) = window.try_state::<Arc<AppState>>() {
-                    let mut ignore_focus_loss_until = state.ignore_focus_loss_until.lock().unwrap();
-                    if ignore_focus_loss_until
-                        .as_ref()
-                        .is_some_and(|until| Instant::now() <= *until)
-                    {
+                    let awaiting_focus_after_show = *state.awaiting_focus_after_show.lock().unwrap();
+                    if awaiting_focus_after_show {
                         return;
                     }
-                    *ignore_focus_loss_until = None;
                 }
 
                 let _ = window.hide();

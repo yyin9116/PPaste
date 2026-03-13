@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { disable as disableAutostart, enable as enableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart';
 
 export interface BackendClip {
   id: string;
@@ -66,7 +67,16 @@ export async function updateShortcut(shortcutType: 'screenshot' | 'toggle_window
 }
 
 export async function setRunAtLogin(enabled: boolean): Promise<void> {
+  if (enabled) {
+    await enableAutostart();
+  } else {
+    await disableAutostart();
+  }
   return invoke('set_run_at_login', { enabled });
+}
+
+export async function getRunAtLogin(): Promise<boolean> {
+  return isAutostartEnabled();
 }
 
 export async function togglePause(): Promise<boolean> {
