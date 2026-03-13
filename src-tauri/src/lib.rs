@@ -69,7 +69,7 @@ impl Default for Settings {
             plain_text_only: false,
             storage_path: default_storage,
             screenshot_shortcut: "Alt+S".to_string(),      // Windows/Linux: Alt+S, macOS: Option+S
-            toggle_window_shortcut: "Alt+Space".to_string(), // Windows/Linux: Alt+Space, macOS: Option+Space
+            toggle_window_shortcut: "Alt+X".to_string(), // Windows/Linux: Alt+X, macOS: Option+X
         }
     }
 }
@@ -890,7 +890,6 @@ fn take_screenshot(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) ->
     
     #[cfg(target_os = "windows")]
     {
-        use std::io::Write;
         let temp_path = std::env::temp_dir().join("ppaste_screenshot.png");
         
         // 使用 PowerShell 截图
@@ -1188,7 +1187,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
+            #[cfg(target_os = "macos")]
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            #[cfg(not(target_os = "macos"))]
+            tauri_plugin_autostart::MacosLauncher::default(),
             None,
         ))
         .plugin(tauri_plugin_opener::init())
@@ -1262,10 +1264,35 @@ pub fn run() {
                     .settings
                     .lock()
                     .map(|s| s.toggle_window_shortcut.clone())
-                    .unwrap_or_else(|_| "Alt+Space".to_string())
+                    .unwrap_or_else(|_| "Alt+X".to_string())
             };
-            apply_toggle_shortcut(app.handle(), &app_state, current_shortcut)?;
-            
+
+            if let Err(err) = apply_toggle_shortcut(app.handle(), &app_state, current_shortcut.clone()) {
+                eprintln!(
+                    "Failed to register shortcut '{}': {}. Falling back to Alt+X.",
+                    current_shortcut,
+                    err
+                );
+
+                let fallback_shortcut = "Alt+X".to_string();
+                if current_shortcut != fallback_shortcut {
+                    if apply_toggle_shortcut(app.handle(), &app_state, fallback_shortcut.clone()).is_ok() {
+                        let next_settings = if let Ok(mut settings) = app_state.settings.lock() {
+                            settings.toggle_window_shortcut = fallback_shortcut;
+                            Some(settings.clone())
+                        } else {
+                            None
+                        };
+
+                        if let Some(next_settings) = next_settings {
+                            if let Ok(conn) = app_state.db.lock() {
+                                let _ = persist_settings(&conn, &next_settings);
+                            }
+                        }
+                    }
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1319,9 +1346,19 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            use tauri::RunEvent;
-            if let RunEvent::Reopen { .. } = event {
-                let _ = show_main_window(app);
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::RunEvent;
+                if let RunEvent::Reopen { .. } = event {
+                    let _ = show_main_window(app);
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let tauri::RunEvent::ExitRequested { .. } = event {
+                    let _ = app;
+                }
             }
         });
 }

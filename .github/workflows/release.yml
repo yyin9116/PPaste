@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   build-release:
-    runs-on: macos-14
+    strategy:
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -42,15 +45,34 @@ jobs:
         run: pnpm bundle
 
       - name: Zip macOS app bundle
+        if: matrix.os == 'macos-14'
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             src-tauri/target/release/bundle/macos/PPaste.app \
             src-tauri/target/release/bundle/macos/PPaste.app.zip
 
+      - name: Collect release files
+        id: release-files
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-14" ]]; then
+            {
+              echo "files<<EOF"
+              echo "src-tauri/target/release/bundle/macos/PPaste.app.zip"
+              echo "src-tauri/target/release/bundle/dmg/PPaste_*.dmg"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "files<<EOF"
+              echo "src-tauri/target/release/bundle/msi/*.msi"
+              echo "src-tauri/target/release/bundle/nsis/*.exe"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           body_path: .github/release-notes/${{ github.ref_name }}.md
-          files: |
-            src-tauri/target/release/bundle/macos/PPaste.app.zip
-            src-tauri/target/release/bundle/dmg/PPaste_*.dmg
+          files: ${{ steps.release-files.outputs.files }}

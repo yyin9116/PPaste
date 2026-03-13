@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PPaste",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "identifier": "com.yinyin.ppaste",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -27,7 +27,7 @@
         "hiddenTitle": true,
         "visible": false,
         "center": true,
-        "titleBarStyle": "Overlay"
+        "shadow": false
       }
     ],
     "security": {
@@ -42,10 +42,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "dmg",
-      "app"
-    ],
+    "targets": "all",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -59,6 +56,16 @@
       "frameworks": [],
       "providerShortName": null,
       "signingIdentity": null
+    },
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": true,
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "installMode": "currentUser"
+      }
     }
   }
 }

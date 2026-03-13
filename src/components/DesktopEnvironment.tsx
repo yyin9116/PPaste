@@ -499,7 +499,7 @@ export default function DesktopEnvironment() {
   useEffect(() => {
     if (!settingsData) return;
     setScreenshotShortcutInput(settingsData.screenshot_shortcut ?? 'Alt+S');
-    setToggleShortcutInput(settingsData.toggle_window_shortcut ?? 'Alt+Space');
+    setToggleShortcutInput(settingsData.toggle_window_shortcut ?? 'Alt+X');
   }, [settingsData?.screenshot_shortcut, settingsData?.toggle_window_shortcut]);
 
   useEffect(() => {
@@ -525,7 +525,7 @@ export default function DesktopEnvironment() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.metaKey && event.key === ',') {
+      if ((event.metaKey || event.ctrlKey) && event.key === ',') {
         event.preventDefault();
         setIsSettingsOpen(true);
         void refreshStats();
@@ -560,9 +560,10 @@ export default function DesktopEnvironment() {
 
   return (
     <div
-      className={`relative h-screen w-full overflow-hidden rounded-[16px] font-sans ${
+      className={`relative h-screen w-full overflow-hidden rounded-2xl border border-gray-100 shadow-sm font-sans dark:border-gray-800 ${
         theme === 'dark' ? 'bg-gray-950 text-gray-100' : 'bg-gray-50 text-gray-900'
       }`}
+      style={{ clipPath: 'inset(0 round 1rem)' }}
     >
       <div className="absolute inset-0 z-0 opacity-40">
         <div
