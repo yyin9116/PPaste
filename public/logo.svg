@@ -21,6 +21,8 @@
     </filter>
   </defs>
 
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#FFFFFF" fill-opacity="0.96" />
+
   <!-- Back Card -->
   <rect x="56" y="20" width="48" height="64" rx="12" fill="url(#backGrad)" stroke="#71717A" stroke-width="1.5" stroke-opacity="0.4" />
 

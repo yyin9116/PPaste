@@ -12,11 +12,20 @@ export interface BackendClip {
   source?: string;
 }
 
+export interface BackendClipEvent {
+  clip: BackendClip;
+  action: 'inserted' | 'promoted' | string;
+  auto_pin: boolean;
+  clear_auto_pin: boolean;
+}
+
 export interface BackendSettings {
-  theme: 'dark' | 'light' | string;
+  theme: 'dark' | 'light' | 'system' | string;
   language: 'zh' | 'en' | string;
+  window_opacity: number;
   launch_at_login: boolean;
   play_sounds: boolean;
+  show_shortcut_hints: boolean;
   history_retention_days: number;
   max_clips: number;
   ignore_password_managers: boolean;
@@ -24,6 +33,8 @@ export interface BackendSettings {
   storage_path?: string;
   screenshot_shortcut?: string;
   toggle_window_shortcut?: string;
+  quick_paste_shortcut?: string;
+  clear_history_shortcut?: string;
 }
 
 export interface ClipStats {
@@ -62,7 +73,10 @@ export async function updateSettings(settings: BackendSettings): Promise<void> {
   return invoke('update_settings', { settings });
 }
 
-export async function updateShortcut(shortcutType: 'screenshot' | 'toggle_window', shortcut: string): Promise<void> {
+export async function updateShortcut(
+  shortcutType: 'screenshot' | 'toggle_window' | 'quick_paste' | 'clear_history',
+  shortcut: string,
+): Promise<void> {
   return invoke('update_shortcut', { shortcutType, shortcut });
 }
 
@@ -95,8 +109,24 @@ export async function getStats(): Promise<ClipStats> {
   return invoke<ClipStats>('get_stats');
 }
 
-export async function listenToNewClip(callback: (clip: BackendClip) => void) {
-  return listen<BackendClip>('new-clip', (event) => {
+export async function exportClipsJson(): Promise<string> {
+  return invoke<string>('export_clips_json');
+}
+
+export async function importClipsJson(payload: string, merge = true): Promise<number> {
+  return invoke<number>('import_clips_json', { payload, merge });
+}
+
+export async function takeScreenshot(): Promise<string> {
+  return invoke<string>('take_screenshot');
+}
+
+export async function revealPath(path: string): Promise<void> {
+  return invoke('reveal_path', { path });
+}
+
+export async function listenToNewClip(callback: (event: BackendClipEvent) => void) {
+  return listen<BackendClipEvent>('new-clip', (event) => {
     callback(event.payload);
   });
 }
