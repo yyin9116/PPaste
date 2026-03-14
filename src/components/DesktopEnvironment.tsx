@@ -30,13 +30,26 @@ import {
   type ClipStats,
 } from '../lib/tauri';
 
-type ThemeMode = 'dark' | 'light';
+type ThemeMode = 'dark' | 'light' | 'system';
+type ResolvedTheme = 'dark' | 'light';
 type Language = 'zh' | 'en';
 
 type SelectOption = {
   value: string;
   label: string;
 };
+
+function normalizeThemeMode(theme: string | undefined): ThemeMode {
+  if (theme === 'dark' || theme === 'light' || theme === 'system') return theme;
+  return 'dark';
+}
+
+function getSystemTheme(): ResolvedTheme {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return 'light';
+  }
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
 
 interface ClipView {
   id: string;
@@ -201,8 +214,10 @@ function formatRelativeTime(timestamp: number, language: Language) {
 }
 
 export default function DesktopEnvironment() {
-  const [theme, setTheme] = useState<ThemeMode>('dark');
+  const [themeMode, setThemeMode] = useState<ThemeMode>('dark');
+  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(getSystemTheme());
   const [language, setLanguage] = useState<Language>('zh');
+  const theme: ResolvedTheme = themeMode === 'system' ? systemTheme : themeMode;
   const [settingsData, setSettingsData] = useState<BackendSettings | null>(null);
 
   const [clips, setClips] = useState<ClipView[]>([]);
@@ -251,6 +266,7 @@ export default function DesktopEnvironment() {
           language: '语言',
           dark: '深色',
           light: '浅色',
+          system: '\u8ddf\u968f\u7cfb\u7edf',
           launchAtLogin: '开机启动',
           launchAtLoginDesc: '系统登录后自动启动 PPaste。',
           shortcuts: '快捷键绑定',
@@ -297,6 +313,7 @@ export default function DesktopEnvironment() {
           language: 'Language',
           dark: 'Dark',
           light: 'Light',
+          system: 'System',
           launchAtLogin: 'Launch at login',
           launchAtLoginDesc: 'Start PPaste at system login.',
           shortcuts: 'Shortcut bindings',
@@ -329,6 +346,7 @@ export default function DesktopEnvironment() {
   const themeOptions: SelectOption[] = [
     { value: 'dark', label: t.dark },
     { value: 'light', label: t.light },
+    { value: 'system', label: t.system },
   ];
 
   const languageOptions: SelectOption[] = [
@@ -340,6 +358,24 @@ export default function DesktopEnvironment() {
     const q = query.trim().toLowerCase();
     return clips.filter((c) => q.length === 0 || c.content.toLowerCase().includes(q) || c.source?.toLowerCase().includes(q));
   }, [clips, query]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const updateTheme = (matches: boolean) => setSystemTheme(matches ? 'dark' : 'light');
+    updateTheme(mediaQuery.matches);
+
+    const handleChange = (event: MediaQueryListEvent) => updateTheme(event.matches);
+
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', handleChange);
+      return () => mediaQuery.removeEventListener('change', handleChange);
+    }
+
+    mediaQuery.addListener(handleChange);
+    return () => mediaQuery.removeListener(handleChange);
+  }, []);
 
   const playFeedbackTone = async () => {
     if (!settingsData?.play_sounds) return;
@@ -396,7 +432,7 @@ export default function DesktopEnvironment() {
         ),
       );
       setSettingsData(effectiveSettings);
-      setTheme((effectiveSettings.theme as ThemeMode) || 'dark');
+      setThemeMode(normalizeThemeMode(effectiveSettings.theme));
       setLanguage((effectiveSettings.language as Language) || 'zh');
     } catch (e) {
       console.error(e);
@@ -421,7 +457,7 @@ export default function DesktopEnvironment() {
     if (!settingsData) return;
     const merged = { ...settingsData, ...next };
     setSettingsData(merged);
-    if (next.theme) setTheme(next.theme as ThemeMode);
+    if (typeof next.theme === 'string') setThemeMode(normalizeThemeMode(next.theme));
     if (next.language) setLanguage(next.language as Language);
     try {
       await updateSettings(merged);
@@ -828,7 +864,7 @@ export default function DesktopEnvironment() {
                     control={
                       <FlatSelect
                         theme={theme}
-                        value={theme}
+                        value={themeMode}
                         options={themeOptions}
                         onChange={(value) => void patchSettings({ theme: value })}
                       />
