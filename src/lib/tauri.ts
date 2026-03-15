@@ -74,7 +74,7 @@ export async function updateSettings(settings: BackendSettings): Promise<void> {
 }
 
 export async function updateShortcut(
-  shortcutType: 'screenshot' | 'toggle_window' | 'quick_paste' | 'clear_history',
+  shortcutType: 'screenshot' | 'toggle_window' | 'quick_paste',
   shortcut: string,
 ): Promise<void> {
   return invoke('update_shortcut', { shortcutType, shortcut });
@@ -93,8 +93,12 @@ export async function getRunAtLogin(): Promise<boolean> {
   return isAutostartEnabled();
 }
 
-export async function togglePause(): Promise<boolean> {
-  return invoke<boolean>('toggle_pause');
+export async function setPauseRecording(paused: boolean): Promise<boolean> {
+  return invoke<boolean>('set_pause_recording', { paused });
+}
+
+export async function getPauseRecording(): Promise<boolean> {
+  return invoke<boolean>('get_pause_recording');
 }
 
 export async function hideWindow(): Promise<void> {
@@ -128,5 +132,11 @@ export async function revealPath(path: string): Promise<void> {
 export async function listenToNewClip(callback: (event: BackendClipEvent) => void) {
   return listen<BackendClipEvent>('new-clip', (event) => {
     callback(event.payload);
+  });
+}
+
+export async function listenToOpenSettings(callback: () => void) {
+  return listen<boolean>('open-settings', () => {
+    callback();
   });
 }

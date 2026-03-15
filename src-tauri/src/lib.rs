@@ -86,7 +86,7 @@ impl Default for Settings {
             plain_text_only: false,
             storage_path: default_storage,
             screenshot_shortcut: "Alt+S".to_string(),      // Windows/Linux: Alt+S, macOS: Option+S
-            toggle_window_shortcut: "Alt+Space".to_string(), // Windows/Linux: Alt+Space, macOS: Option+Space
+            toggle_window_shortcut: "Alt+X".to_string(), // Windows/Linux: Alt+Space, macOS: Option+Space
             quick_paste_shortcut: "CmdOrCtrl+Shift+V".to_string(),
             clear_history_shortcut: "CmdOrCtrl+Shift+Backspace".to_string(),
         }
@@ -331,6 +331,15 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                 }
                 
                 // 检查图片剪贴板
+                let plain_text_only = {
+                    let settings = state.settings.lock().unwrap();
+                    settings.plain_text_only
+                };
+                if plain_text_only {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
                 match clipboard.get_image() {
                     Ok(image_data) => {
                         use std::collections::hash_map::DefaultHasher;
@@ -1137,10 +1146,15 @@ fn set_run_at_login(state: tauri::State<Arc<AppState>>, enabled: bool) -> Result
 }
 
 #[tauri::command]
-fn toggle_pause(state: tauri::State<Arc<AppState>>) -> bool {
+fn set_pause_recording(state: tauri::State<Arc<AppState>>, paused: bool) -> bool {
     let mut is_paused = state.is_paused.lock().unwrap();
-    *is_paused = !*is_paused;
+    *is_paused = paused;
     *is_paused
+}
+
+#[tauri::command]
+fn get_pause_recording(state: tauri::State<Arc<AppState>>) -> bool {
+    *state.is_paused.lock().unwrap()
 }
 
 #[tauri::command]
@@ -1359,11 +1373,80 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
     
     #[cfg(target_os = "windows")]
     {
-        use std::io::Write;
-        let temp_path = std::env::temp_dir().join("ppaste_screenshot.png");
-        
-        // 使用 PowerShell 截图
-        let ps_script = r#"
+        use image::{ImageBuffer, Rgba};
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::Instant;
+
+        let hash_image = |bytes: &[u8]| -> u64 {
+            let mut hasher = DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let previous_image_hash = Clipboard::new()
+            .ok()
+            .and_then(|mut clipboard| clipboard.get_image().ok())
+            .map(|image| hash_image(image.bytes.as_ref()));
+
+        let launch_status = Command::new("cmd")
+            .args(["/C", "start", "", "ms-screenclip:"])
+            .status();
+
+        let png_bytes = if launch_status.is_ok() {
+            let mut snipped_png: Option<Vec<u8>> = None;
+            let deadline = Instant::now() + Duration::from_secs(20);
+
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(180));
+
+                let mut clipboard = match Clipboard::new() {
+                    Ok(clipboard) => clipboard,
+                    Err(_) => continue,
+                };
+
+                let image_data = match clipboard.get_image() {
+                    Ok(image) => image,
+                    Err(_) => continue,
+                };
+
+                let current_hash = hash_image(image_data.bytes.as_ref());
+                if previous_image_hash == Some(current_hash) {
+                    continue;
+                }
+
+                let bytes_vec = image_data.bytes.to_vec();
+                let img = match ImageBuffer::<Rgba<u8>, _>::from_raw(
+                    image_data.width as u32,
+                    image_data.height as u32,
+                    bytes_vec,
+                ) {
+                    Some(img) => img,
+                    None => continue,
+                };
+
+                let mut encoded = Vec::new();
+                let mut cursor = std::io::Cursor::new(&mut encoded);
+                if img.write_to(&mut cursor, image::ImageFormat::Png).is_ok() {
+                    snipped_png = Some(encoded);
+                    break;
+                }
+            }
+
+            match snipped_png {
+                Some(bytes) => bytes,
+                None => {
+                    if should_restore_window {
+                        let _ = show_main_window(app);
+                    }
+                    return Err("Screenshot cancelled".to_string());
+                }
+            }
+        } else {
+            let temp_path = std::env::temp_dir().join("ppaste_screenshot.png");
+
+            // fallback to full-screen screenshot
+            let ps_script = r#"
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen
@@ -1374,35 +1457,43 @@ $bitmap.Save("$env:TEMP\ppaste_screenshot.png")
 $graphics.Dispose()
 $bitmap.Dispose()
 "#;
-        
-        let output = Command::new("powershell")
-            .args(["-Command", ps_script])
-            .output()
-            .map_err(|e| format!("Failed to capture screen: {}", e))?;
-        
-        if output.status.success() {
-            let png_bytes = std::fs::read(&temp_path).map_err(|e| e.to_string())?;
-            
-            // 保存到存储路径
-            let file_path = save_image_to_storage(&storage_path, &png_bytes, &clip_id)?;
-            let base64_data = BASE64.encode(&png_bytes);
-            
-            save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "Screenshot".to_string(), Some(file_path));
-            
-            let _ = std::fs::remove_file(temp_path);
-            if should_restore_window {
-                let _ = show_main_window(app);
+
+            let output = Command::new("powershell")
+                .args(["-Command", ps_script])
+                .output()
+                .map_err(|e| format!("Failed to capture screen: {}", e))?;
+
+            if !output.status.success() {
+                if should_restore_window {
+                    let _ = show_main_window(app);
+                }
+                return Err("Screenshot command failed".to_string());
             }
-            
-            return Ok(base64_data);
-        } else {
-            if should_restore_window {
-                let _ = show_main_window(app);
-            }
-            return Err("Screenshot command failed".to_string());
+
+            let full_png = std::fs::read(&temp_path).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&temp_path);
+            full_png
+        };
+
+        let file_path = save_image_to_storage(&storage_path, &png_bytes, &clip_id)?;
+        let base64_data = BASE64.encode(&png_bytes);
+
+        save_clip_with_path(
+            state,
+            Some(app),
+            base64_data.clone(),
+            "image".to_string(),
+            "Screenshot".to_string(),
+            Some(file_path),
+        );
+
+        if should_restore_window {
+            let _ = show_main_window(app);
         }
+
+        return Ok(base64_data);
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         let temp_path = "/tmp/ppaste_screenshot.png";
@@ -1792,17 +1883,28 @@ pub fn run() {
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        remember_frontmost_app(app);
-                        let _ = show_main_window(app);
+                                .on_menu_event({
+                    let app_state = Arc::clone(&app_state);
+                    move |app, event| match event.id.as_ref() {
+                        "show" => {
+                            remember_frontmost_app(app);
+                            let _ = show_main_window(app);
+                        }
+                        "pause" => {
+                            if let Ok(mut paused) = app_state.is_paused.lock() {
+                                *paused = !*paused;
+                            }
+                        }
+                        "settings" => {
+                            remember_frontmost_app(app);
+                            let _ = show_main_window(app);
+                            let _ = app.emit("open-settings", true);
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
                     }
-                    "pause" => {}
-                    "settings" => {}
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
                     use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -1850,7 +1952,7 @@ pub fn run() {
                     .settings
                     .lock()
                     .map(|s| s.toggle_window_shortcut.clone())
-                    .unwrap_or_else(|_| "Alt+Space".to_string())
+                    .unwrap_or_else(|_| "Alt+X".to_string())
             };
             apply_toggle_shortcut(app.handle(), &app_state, current_shortcut)?;
             let quick_paste_shortcut = {
@@ -1858,17 +1960,9 @@ pub fn run() {
                     .settings
                     .lock()
                     .map(|s| s.quick_paste_shortcut.clone())
-                    .unwrap_or_else(|_| "Meta+Shift+V".to_string())
+                    .unwrap_or_else(|_| "CmdOrCtrl+Shift+V".to_string())
             };
             apply_quick_paste_shortcut(app.handle(), &app_state, quick_paste_shortcut)?;
-            let clear_history_shortcut = {
-                app_state
-                    .settings
-                    .lock()
-                    .map(|s| s.clear_history_shortcut.clone())
-                    .unwrap_or_else(|_| "Meta+Shift+Backspace".to_string())
-            };
-            apply_clear_history_shortcut(app.handle(), &app_state, clear_history_shortcut)?;
             
             Ok(())
         })
@@ -1907,7 +2001,8 @@ pub fn run() {
             get_settings,
             update_settings,
             set_run_at_login,
-            toggle_pause,
+            set_pause_recording,
+            get_pause_recording,
             hide_window,
             show_window,
             reveal_path,
@@ -1926,10 +2021,20 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            use tauri::RunEvent;
-            if let RunEvent::Reopen { .. } = event {
-                remember_frontmost_app(app);
-                let _ = show_main_window(app);
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::RunEvent;
+                if let RunEvent::Reopen { .. } = event {
+                    remember_frontmost_app(app);
+                    let _ = show_main_window(app);
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let tauri::RunEvent::ExitRequested { .. } = event {
+                    let _ = app;
+                }
             }
         });
 }

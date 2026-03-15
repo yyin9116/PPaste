@@ -30,6 +30,7 @@ import {
   hideWindow,
   importClipsJson,
   listenToNewClip,
+  listenToOpenSettings,
   pasteClip,
   revealPath,
   setRunAtLogin,
@@ -225,14 +226,31 @@ function formatRelativeTime(timestamp: number, language: Language) {
   return rtf.format(days, 'day');
 }
 
+function getShortcutDisplayPlatform() {
+  if (typeof navigator === 'undefined') return 'windows';
+  const platform = `${navigator.platform} ${navigator.userAgent}`.toLowerCase();
+  if (platform.includes('mac')) return 'mac';
+  if (platform.includes('win')) return 'windows';
+  return 'linux';
+}
+
 function shortcutToDisplay(shortcut: string) {
+  if (getShortcutDisplayPlatform() === 'mac') {
+    return shortcut
+      .replace(/CommandOrControl|CmdOrCtrl/g, '\u2318')
+      .replace(/Meta/g, '\u2318')
+      .replace(/Option|Alt/g, '\u2325')
+      .replace(/Shift/g, '\u21e7')
+      .replace(/Ctrl/g, '\u2303')
+      .replace(/Plus/g, '+');
+  }
+
   return shortcut
-    .replace(/CmdOrCtrl/g, '⌘')
-    .replace(/CommandOrControl/g, '⌘')
-    .replace(/Meta/g, '⌘')
-    .replace(/Alt/g, '⌥')
-    .replace(/Shift/g, '⇧')
-    .replace(/Ctrl/g, '⌃')
+    .replace(/CommandOrControl|CmdOrCtrl/g, 'Ctrl')
+    .replace(/Meta/g, 'Win')
+    .replace(/Option/g, 'Alt')
+    .replace(/Shift/g, 'Shift')
+    .replace(/Ctrl/g, 'Ctrl')
     .replace(/Plus/g, '+');
 }
 
@@ -295,7 +313,6 @@ const TRANSLATIONS = {
     maxClips: 'Maximum clips',
     toggleClipboard: 'Toggle Clipboard',
     quickPaste: 'Quick Paste (Latest)',
-    clearHistoryShortcut: 'Clear History',
     screenshotShortcut: 'Take Screenshot',
     shortcutHint: 'Click on a shortcut to record a new key combination.',
     ignorePasswordManagers: 'Ignore Password Managers',
@@ -378,7 +395,6 @@ const TRANSLATIONS = {
     maxClips: '最大记录数',
     toggleClipboard: '唤起剪贴板',
     quickPaste: '快速粘贴 (最新)',
-    clearHistoryShortcut: '清除历史记录',
     screenshotShortcut: '截图',
     shortcutHint: '点击快捷键以录制新的按键组合。',
     ignorePasswordManagers: '忽略密码管理器',
@@ -448,7 +464,7 @@ function buildDefaultSettings(): BackendSettings {
     ignore_password_managers: true,
     plain_text_only: false,
     screenshot_shortcut: 'Alt+S',
-    toggle_window_shortcut: 'Alt+Space',
+    toggle_window_shortcut: 'Alt+X',
     quick_paste_shortcut: 'CmdOrCtrl+Shift+V',
     clear_history_shortcut: 'CmdOrCtrl+Shift+Backspace',
   };
@@ -548,7 +564,7 @@ export default function DesktopEnvironment() {
   useEffect(() => {
     void syncData();
     const interval = window.setInterval(() => void syncData(), 30000);
-    const unlistenPromise = listenToNewClip((event: BackendClipEvent) => {
+    const unlistenNewClipPromise = listenToNewClip((event: BackendClipEvent) => {
       const nextAutoPinnedClipId = event.auto_pin ? event.clip.id : event.clear_auto_pin ? null : autoPinnedClipId;
       if (event.auto_pin || event.clear_auto_pin) {
         setAutoPinnedClipId(nextAutoPinnedClipId);
@@ -562,9 +578,13 @@ export default function DesktopEnvironment() {
         );
       });
     });
+    const unlistenOpenSettingsPromise = listenToOpenSettings(() => {
+      setIsSettingsOpen(true);
+    });
     return () => {
       window.clearInterval(interval);
-      void unlistenPromise.then((unlisten) => unlisten());
+      void unlistenNewClipPromise.then((unlisten) => unlisten());
+      void unlistenOpenSettingsPromise.then((unlisten) => unlisten());
     };
   }, [autoPinnedClipId, pinnedClipIds, syncData]);
 
@@ -596,7 +616,7 @@ export default function DesktopEnvironment() {
   );
 
   const saveShortcut = useCallback(
-    async (shortcutType: 'screenshot' | 'toggle_window' | 'quick_paste' | 'clear_history', shortcut: string) => {
+    async (shortcutType: 'screenshot' | 'toggle_window' | 'quick_paste', shortcut: string) => {
       await updateShortcut(shortcutType, shortcut);
       setSettingsData((prev) =>
         prev
@@ -605,7 +625,6 @@ export default function DesktopEnvironment() {
               ...(shortcutType === 'screenshot' ? { screenshot_shortcut: shortcut } : {}),
               ...(shortcutType === 'toggle_window' ? { toggle_window_shortcut: shortcut } : {}),
               ...(shortcutType === 'quick_paste' ? { quick_paste_shortcut: shortcut } : {}),
-              ...(shortcutType === 'clear_history' ? { clear_history_shortcut: shortcut } : {}),
             }
           : prev,
       );
@@ -719,6 +738,10 @@ export default function DesktopEnvironment() {
       await playFeedbackTone();
       showToast(t.screenshotCaptured);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/cancelled|canceled/i.test(message)) {
+        return;
+      }
       console.error(error);
       showToast(t.failed, 'error');
     }
@@ -730,9 +753,8 @@ export default function DesktopEnvironment() {
       await Promise.all([
         setRunAtLogin(defaults.launch_at_login),
         updateShortcut('screenshot', defaults.screenshot_shortcut ?? 'Alt+S'),
-        updateShortcut('toggle_window', defaults.toggle_window_shortcut ?? 'Alt+Space'),
+        updateShortcut('toggle_window', defaults.toggle_window_shortcut ?? 'Alt+X'),
         updateShortcut('quick_paste', defaults.quick_paste_shortcut ?? 'CmdOrCtrl+Shift+V'),
-        updateShortcut('clear_history', defaults.clear_history_shortcut ?? 'CmdOrCtrl+Shift+Backspace'),
       ]);
       setThemePreference(defaults.theme as ThemePreference);
       setLanguage(defaults.language as Language);
@@ -876,6 +898,7 @@ function ClipboardPalette({
   onTogglePinned: (id: string) => void;
 }) {
   const t = TRANSLATIONS[language];
+  const isMac = useMemo(() => getShortcutDisplayPlatform() === 'mac', []);
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -954,13 +977,13 @@ function ClipboardPalette({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.metaKey && event.key === ',') {
+      if ((isMac ? event.metaKey : event.ctrlKey) && event.key === ',') {
         event.preventDefault();
         onOpenSettings();
         return;
       }
 
-      if (event.metaKey && event.key.toLowerCase() === 'c') {
+      if ((isMac ? event.metaKey : event.ctrlKey) && event.key.toLowerCase() === 'c') {
         event.preventDefault();
         const selected = getActiveClip();
         if (selected) onCopyClip(selected);
@@ -1012,7 +1035,7 @@ function ClipboardPalette({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [closeQuickLook, getActiveClip, onClose, onCopyClip, onOpenSettings, onPasteClip, openQuickLook, query, quickLookItem, recentQueries, saveQuery, selectedIndex, showSuggestions]);
+  }, [closeQuickLook, getActiveClip, isMac, onClose, onCopyClip, onOpenSettings, onPasteClip, openQuickLook, query, quickLookItem, recentQueries, saveQuery, selectedIndex, showSuggestions]);
 
   const categories = [
     { id: 'all', label: t.all },
@@ -1196,14 +1219,14 @@ function ClipboardPalette({
             }`}
           >
             <div className="flex min-w-0 flex-wrap items-center gap-3">
-              <ShortcutHint theme={theme} keys={['↑', '↓']} label={t.navigate} />
-              <ShortcutHint theme={theme} keys={['↵']} label={t.paste} />
-              <ShortcutHint theme={theme} keys={['⌘', 'C']} label={t.copy} />
+              <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
+              <ShortcutHint theme={theme} keys={['Enter']} label={t.paste} />
+              <ShortcutHint theme={theme} keys={isMac ? ['Cmd', 'C'] : ['Ctrl', 'C']} label={t.copy} />
               <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />
             </div>
             <div className="ml-auto flex min-w-0 flex-wrap items-center gap-3">
-              <ShortcutHint theme={theme} keys={['⌥', 'S']} label={t.screenshotShortcut} />
-              <ShortcutHint theme={theme} keys={['⌘', ',']} label={t.settings} />
+              <ShortcutHint theme={theme} keys={isMac ? ['Option', 'S'] : ['Alt', 'S']} label={t.screenshotShortcut} />
+              <ShortcutHint theme={theme} keys={isMac ? ['Cmd', ','] : ['Ctrl', ',']} label={t.settings} />
               <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
             </div>
           </div>
@@ -1650,7 +1673,7 @@ function SettingsModal({
   onMaxClipsChange: (value: string) => void;
   onToggleIgnorePasswordManagers: () => void;
   onTogglePlainTextOnly: () => void;
-  onSaveShortcut: (type: 'screenshot' | 'toggle_window' | 'quick_paste' | 'clear_history', shortcut: string) => void;
+  onSaveShortcut: (type: 'screenshot' | 'toggle_window' | 'quick_paste', shortcut: string) => void;
   onExport: () => void;
   onImport: (file: File | null) => void;
   onRestoreDefaults: () => void;
@@ -1765,9 +1788,8 @@ function SettingsModal({
                     <h3 className={`mb-4 text-lg font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.shortcuts}</h3>
                     <div className="space-y-4">
                       <ShortcutSetting theme={theme} label={t.screenshotShortcut} value={settings.screenshot_shortcut ?? 'Alt+S'} onChange={(value) => onSaveShortcut('screenshot', value)} />
-                      <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? 'Alt+Space'} onChange={(value) => onSaveShortcut('toggle_window', value)} />
+                      <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? 'Alt+X'} onChange={(value) => onSaveShortcut('toggle_window', value)} />
                       <ShortcutSetting theme={theme} label={t.quickPaste} value={settings.quick_paste_shortcut ?? 'CmdOrCtrl+Shift+V'} onChange={(value) => onSaveShortcut('quick_paste', value)} />
-                      <ShortcutSetting theme={theme} label={t.clearHistoryShortcut} value={settings.clear_history_shortcut ?? 'CmdOrCtrl+Shift+Backspace'} onChange={(value) => onSaveShortcut('clear_history', value)} />
                     </div>
                   </div>
                   <div className={`rounded-xl border p-4 text-sm ${theme === 'dark' ? 'border-indigo-500/20 bg-indigo-500/10 text-indigo-200' : 'border-indigo-200 bg-indigo-50 text-indigo-800'}`}>
@@ -2138,7 +2160,9 @@ function ShortcutSetting({
       if (!normalizedKey) return;
       if (!parts.includes(normalizedKey)) parts.push(normalizedKey);
 
-      onChange(parts.join('+'));
+      const recorded = parts.join('+');
+      const normalized = getShortcutDisplayPlatform() === 'mac' ? recorded : recorded.replace(/Meta/g, 'Ctrl');
+      onChange(normalized);
       setIsRecording(false);
     };
 
