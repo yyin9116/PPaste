@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "bundle": "CI=true tauri build"
+    "bundle": "corepack pnpm tauri build"
   },
   "dependencies": {
     "react": "^19.1.0",
