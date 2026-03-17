@@ -121,6 +121,14 @@ export async function importClipsJson(payload: string, merge = true): Promise<nu
   return invoke<number>('import_clips_json', { payload, merge });
 }
 
+export async function exportClips(filePath: string): Promise<number> {
+  return invoke<number>('export_clips', { filePath });
+}
+
+export async function importClips(filePath: string, merge = true): Promise<number> {
+  return invoke<number>('import_clips', { filePath, merge });
+}
+
 export async function takeScreenshot(): Promise<string> {
   return invoke<string>('take_screenshot');
 }

@@ -51,6 +51,19 @@ jobs:
             src-tauri/target/release/bundle/macos/PPaste.app \
             src-tauri/target/release/bundle/macos/PPaste.app.zip
 
+      - name: Normalize Windows artifact names
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-artifacts/windows | Out-Null
+          Get-ChildItem src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | ForEach-Object {
+            $normalized = $_.Name -replace '_[a-z]{2}-[A-Z]{2}\.msi$', '.msi'
+            Copy-Item $_.FullName -Destination (Join-Path 'release-artifacts/windows' $normalized) -Force
+          }
+          Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination (Join-Path 'release-artifacts/windows' $_.Name) -Force
+          }
+
       - name: Collect release files
         id: release-files
         shell: bash
@@ -65,8 +78,8 @@ jobs:
           else
             {
               echo "files<<EOF"
-              echo "src-tauri/target/release/bundle/msi/*.msi"
-              echo "src-tauri/target/release/bundle/nsis/*.exe"
+              echo "release-artifacts/windows/*.msi"
+              echo "release-artifacts/windows/*.exe"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           fi
@@ -74,5 +87,6 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: .github/release-notes/${{ github.ref_name }}.md
+          body: |
+            Release ${{ github.ref_name }}
           files: ${{ steps.release-files.outputs.files }}

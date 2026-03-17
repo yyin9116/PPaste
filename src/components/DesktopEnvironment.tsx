@@ -23,12 +23,12 @@ import {
 import {
   clearAllClips,
   deleteClip,
-  exportClipsJson,
+  exportClips,
   getClips,
   getRunAtLogin,
   getSettings,
   hideWindow,
-  importClipsJson,
+  importClips,
   listenToNewClip,
   listenToOpenSettings,
   pasteClip,
@@ -42,6 +42,7 @@ import {
   type BackendClipEvent,
   type BackendSettings,
 } from '../lib/tauri';
+import { open, save } from '@tauri-apps/plugin-dialog';
 
 type ThemeMode = 'dark' | 'light';
 type ThemePreference = ThemeMode | 'system';
@@ -199,10 +200,14 @@ function mapClip(clip: BackendClip, pinnedClipIds: string[], autoPinnedClipId: s
   };
 }
 
+function isLinkClip(clip: Pick<ClipView, 'type' | 'resolvedCategory' | 'content'>) {
+  return clip.type === 'link' || clip.resolvedCategory === 'Links' || /^https?:\/\//.test(clip.content.trim());
+}
+
 function getCategoryBucket(clip: ClipView): Exclude<ActiveCategory, 'all'> {
   if (clip.type === 'image' || clip.resolvedCategory === 'Images') return 'images';
   if (clip.type === 'file' || clip.resolvedCategory === 'Files') return 'files';
-  if (clip.type === 'link' || clip.resolvedCategory === 'Links') return 'links';
+  if (isLinkClip(clip)) return 'links';
   if (['Code', 'JSON', 'HTML', 'Markdown', 'YAML', 'SQL', 'Shell', 'Markup'].includes(clip.resolvedCategory)) return 'code';
   return 'notes';
 }
@@ -685,16 +690,13 @@ export default function DesktopEnvironment() {
 
   const handleExportHistory = useCallback(async () => {
     try {
-      const json = await exportClipsJson();
-      const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = 'ppaste-history.json';
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
+      const target = await save({
+        defaultPath: 'ppaste-history.json',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!target || Array.isArray(target)) return;
+
+      await exportClips(target);
       showToast(t.exported);
     } catch (error) {
       console.error(error);
@@ -702,21 +704,22 @@ export default function DesktopEnvironment() {
     }
   }, [showToast, t.exported, t.failed]);
 
-  const handleImportHistory = useCallback(
-    async (file: File | null) => {
-      if (!file) return;
-      try {
-        const payload = await file.text();
-        await importClipsJson(payload, true);
-        await syncData();
-        showToast(t.imported);
-      } catch (error) {
-        console.error(error);
-        showToast(t.failed, 'error');
-      }
-    },
-    [showToast, syncData, t.failed, t.imported],
-  );
+  const handleImportHistory = useCallback(async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      });
+      if (!selected || Array.isArray(selected)) return;
+
+      await importClips(selected, true);
+      await syncData();
+      showToast(t.imported);
+    } catch (error) {
+      console.error(error);
+      showToast(t.failed, 'error');
+    }
+  }, [showToast, syncData, t.failed, t.imported]);
 
   const handleClearAll = useCallback(async () => {
     try {
@@ -1218,15 +1221,13 @@ function ClipboardPalette({
               theme === 'dark' ? 'border-white/5 bg-black/20 text-neutral-500' : 'border-black/5 bg-black/5 text-neutral-500'
             }`}
           >
-            <div className="flex min-w-0 flex-wrap items-center gap-3">
+            <div className="flex min-w-0 items-center gap-3">
               <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
               <ShortcutHint theme={theme} keys={['Enter']} label={t.paste} />
-              <ShortcutHint theme={theme} keys={isMac ? ['Cmd', 'C'] : ['Ctrl', 'C']} label={t.copy} />
               <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />
             </div>
-            <div className="ml-auto flex min-w-0 flex-wrap items-center gap-3">
+            <div className="ml-4 flex min-w-0 items-center gap-3">
               <ShortcutHint theme={theme} keys={isMac ? ['Option', 'S'] : ['Alt', 'S']} label={t.screenshotShortcut} />
-              <ShortcutHint theme={theme} keys={isMac ? ['Cmd', ','] : ['Ctrl', ',']} label={t.settings} />
               <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
             </div>
           </div>
@@ -1287,7 +1288,7 @@ const QuickLookItem = memo(function QuickLookItem({
           <div className="flex items-center gap-2">
             {clip.type === 'image' ? (
               <ImageIcon size={16} className="text-indigo-500" />
-            ) : clip.type === 'link' ? (
+            ) : isLinkClip(clip) ? (
               <LinkIcon size={16} className="text-indigo-500" />
             ) : getCategoryBucket(clip) === 'code' ? (
               <Code size={16} className="text-indigo-500" />
@@ -1317,7 +1318,7 @@ const QuickLookItem = memo(function QuickLookItem({
                 decoding="async"
               />
             </div>
-          ) : clip.type === 'link' ? (
+          ) : isLinkClip(clip) ? (
             <div className="flex h-full w-full min-h-[360px] flex-col gap-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
@@ -1453,7 +1454,7 @@ const ClipItem = memo(function ClipItem({
   const icon = useMemo(() => {
     if (getCategoryBucket(clip) === 'code') return <Code size={14} />;
     if (clip.type === 'image') return <ImageIcon size={14} />;
-    if (clip.type === 'link') return <LinkIcon size={14} />;
+    if (isLinkClip(clip)) return <LinkIcon size={14} />;
     return <FileText size={14} />;
   }, [clip]);
 
@@ -1675,7 +1676,7 @@ function SettingsModal({
   onTogglePlainTextOnly: () => void;
   onSaveShortcut: (type: 'screenshot' | 'toggle_window' | 'quick_paste', shortcut: string) => void;
   onExport: () => void;
-  onImport: (file: File | null) => void;
+  onImport: () => void;
   onRestoreDefaults: () => void;
   onClearAll: () => void;
   onClose: () => void;
@@ -1815,25 +1816,7 @@ function SettingsModal({
                     <div className="space-y-4">
                       <ActionRow theme={theme} title={t.exportHistory} description={t.exportDesc} actionLabel={t.exportHistory} onClick={onExport} />
                       <ActionRow theme={theme} title={t.restoreDefaults} description={t.restoreDefaultsDesc} actionLabel={t.restoreDefaults} onClick={onRestoreDefaults} />
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <div className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{t.importHistory}</div>
-                          <div className="mt-0.5 text-xs text-neutral-500">{t.importDesc}</div>
-                        </div>
-                        <label className={`inline-flex h-8 shrink-0 cursor-pointer items-center whitespace-nowrap rounded-lg px-3 text-xs font-medium transition-colors ${theme === 'dark' ? 'bg-white/5 text-neutral-200 hover:bg-white/10' : 'bg-black/5 text-neutral-800 hover:bg-black/10'}`}>
-                          {t.importHistory}
-                          <input
-                            type="file"
-                            accept=".json,application/json"
-                            className="hidden"
-                            onChange={(event) => {
-                              const file = event.target.files?.[0] ?? null;
-                              void onImport(file);
-                              event.currentTarget.value = '';
-                            }}
-                          />
-                        </label>
-                      </div>
+                      <ActionRow theme={theme} title={t.importHistory} description={t.importDesc} actionLabel={t.importHistory} onClick={onImport} />
                     </div>
                   </div>
 

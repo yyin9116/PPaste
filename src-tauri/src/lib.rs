@@ -1862,6 +1862,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(app_state.clone())
         .setup(move |app| {
             // 创建托盘菜单
