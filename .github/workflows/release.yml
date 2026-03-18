@@ -51,17 +51,31 @@ jobs:
             src-tauri/target/release/bundle/macos/PPaste.app \
             src-tauri/target/release/bundle/macos/PPaste.app.zip
 
+      - name: Normalize macOS artifact names
+        if: matrix.os == 'macos-14'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release-artifacts/macos
+          cp "src-tauri/target/release/bundle/macos/PPaste.app.zip" "release-artifacts/macos/ppaste-${VERSION}-macos-aarch64.zip"
+          DMG_FILE=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -n 1)
+          cp "$DMG_FILE" "release-artifacts/macos/ppaste-${VERSION}-macos-aarch64.dmg"
+
       - name: Normalize Windows artifact names
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
           New-Item -ItemType Directory -Force -Path release-artifacts/windows | Out-Null
-          Get-ChildItem src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | ForEach-Object {
-            $normalized = $_.Name -replace '_[a-z]{2}-[A-Z]{2}\.msi$', '.msi'
-            Copy-Item $_.FullName -Destination (Join-Path 'release-artifacts/windows' $normalized) -Force
+
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) {
+            Copy-Item $msi.FullName -Destination (Join-Path 'release-artifacts/windows' "ppaste-$version-windows-x64.msi") -Force
           }
-          Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | ForEach-Object {
-            Copy-Item $_.FullName -Destination (Join-Path 'release-artifacts/windows' $_.Name) -Force
+
+          $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            Copy-Item $exe.FullName -Destination (Join-Path 'release-artifacts/windows' "ppaste-$version-windows-x64.exe") -Force
           }
 
       - name: Collect release files
@@ -71,8 +85,8 @@ jobs:
           if [[ "${{ matrix.os }}" == "macos-14" ]]; then
             {
               echo "files<<EOF"
-              echo "src-tauri/target/release/bundle/macos/PPaste.app.zip"
-              echo "src-tauri/target/release/bundle/dmg/PPaste_*.dmg"
+              echo "release-artifacts/macos/*.zip"
+              echo "release-artifacts/macos/*.dmg"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else

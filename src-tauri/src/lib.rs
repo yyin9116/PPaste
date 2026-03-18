@@ -1866,17 +1866,12 @@ pub fn run() {
         .manage(app_state.clone())
         .setup(move |app| {
             // 创建托盘菜单
-            let show = MenuItem::with_id(app, "show", "打开剪贴板", true, None::<&str>)?;
-            let pause = MenuItem::with_id(app, "pause", "暂停记录", true, None::<&str>)?;
-            let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出 PPaste", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "打开剪贴板 / Open Clipboard", true, None::<&str>)?;
+            let pause = MenuItem::with_id(app, "pause", "暂停记录 / Pause Recording", true, None::<&str>)?;
+            let settings = MenuItem::with_id(app, "settings", "设置 / Settings", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出 PPaste / Quit PPaste", true, None::<&str>)?;
             
             let menu = Menu::with_items(app, &[&show, &pause, &settings, &quit])?;
-            
-            // 启动后默认隐藏，通过托盘或快捷键唤起
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.hide();
-            }
             
             // 创建托盘图标
             let _tray = TrayIconBuilder::new()
@@ -1935,6 +1930,9 @@ pub fn run() {
                     let _ = show_main_window(&app);
                 })
                 .build(app)?;
+
+            // 启动应用时主动显示主窗口
+            let _ = show_main_window(app.handle());
 
             // 启动剪贴板监控（需要 AppHandle 用于事件推送）
             start_clipboard_monitor(app.handle().clone(), Arc::clone(&app_state));

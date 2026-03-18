@@ -1,6 +1,6 @@
 [package]
 name = "ppaste"
-version = "0.1.1"
+version = "0.1.2"
 description = "A minimalist, keyboard-centric clipboard manager"
 authors = ["yinyin"]
 edition = "2021"
