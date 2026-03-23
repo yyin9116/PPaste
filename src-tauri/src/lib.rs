@@ -613,7 +613,7 @@ fn save_clip_with_path(
             if let Err(e) = conn.execute(
                 "UPDATE clips
                  SET category = ?1, timestamp = ?2, source = ?3, file_path = COALESCE(?4, file_path), file_ext = COALESCE(?5, file_ext)
-                 WHERE id = ?5",
+                 WHERE id = ?6",
                 params![clip.category, clip.timestamp, clip.source, file_path, file_ext, clip.id],
             ) {
                 eprintln!("Failed to promote existing clip: {}", e);
