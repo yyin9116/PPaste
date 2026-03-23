@@ -1,6 +1,7 @@
 use arboard::{Clipboard, ImageData};
 use chrono::Utc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use image::ImageFormat;
 use rusqlite::{Connection, params};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ pub struct Clip {
     pub preview: Option<String>,
     pub timestamp: i64,
     pub source: Option<String>,
+    pub file_ext: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,19 @@ pub struct ClipEvent {
     pub action: String,
     pub auto_pin: bool,
     pub clear_auto_pin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletedClip {
+    pub id: String,
+    pub clip_type: String,
+    pub category: Option<String>,
+    pub content: String,
+    pub preview: Option<String>,
+    pub timestamp: i64,
+    pub source: Option<String>,
+    pub file_ext: Option<String>,
+    pub deleted_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +68,7 @@ pub struct Settings {
     pub play_sounds: bool,
     pub show_shortcut_hints: bool,
     pub history_retention_days: i32,
+    pub recycle_bin_retention_days: i32,
     pub max_clips: i32,
     pub ignore_password_managers: bool,
     pub plain_text_only: bool,
@@ -81,6 +97,7 @@ impl Default for Settings {
             play_sounds: false,
             show_shortcut_hints: true,
             history_retention_days: 30,
+            recycle_bin_retention_days: 30,
             max_clips: 500,
             ignore_password_managers: true,
             plain_text_only: false,
@@ -110,6 +127,7 @@ pub struct AppState {
     pub last_frontmost_app: Arc<Mutex<Option<String>>>,
     pub duplicate_hit_counts: Arc<Mutex<HashMap<u64, u32>>>,
     pub auto_pinned_signature: Arc<Mutex<Option<u64>>>,
+    pub tray_id: String,
 }
 
 // --- 数据库初始化 ---
@@ -160,7 +178,8 @@ fn init_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
             preview TEXT,
             timestamp INTEGER NOT NULL,
             source TEXT,
-            file_path TEXT  -- 图片/文件的实际存储路径
+            file_path TEXT,  -- 图片/文件的实际存储路径
+            file_ext TEXT
         )",
         [],
     )?;
@@ -169,6 +188,22 @@ fn init_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS deleted_clips (
+            id TEXT PRIMARY KEY,
+            clip_type TEXT NOT NULL,
+            category TEXT,
+            content TEXT NOT NULL,
+            preview TEXT,
+            timestamp INTEGER NOT NULL,
+            source TEXT,
+            file_path TEXT,
+            file_ext TEXT,
+            deleted_at INTEGER NOT NULL
         )",
         [],
     )?;
@@ -183,15 +218,35 @@ fn migrate_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
 
     let mut has_file_path = false;
+    let mut has_file_ext = false;
     for column in columns {
-        if column? == "file_path" {
+        let col = column?;
+        if col == "file_path" {
             has_file_path = true;
-            break;
+        }
+        if col == "file_ext" {
+            has_file_ext = true;
         }
     }
 
     if !has_file_path {
         conn.execute("ALTER TABLE clips ADD COLUMN file_path TEXT", [])?;
+    }
+    if !has_file_ext {
+        conn.execute("ALTER TABLE clips ADD COLUMN file_ext TEXT", [])?;
+    }
+
+    let mut deleted_stmt = conn.prepare("PRAGMA table_info(deleted_clips)")?;
+    let deleted_columns = deleted_stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut deleted_has_file_ext = false;
+    for column in deleted_columns {
+        if column? == "file_ext" {
+            deleted_has_file_ext = true;
+            break;
+        }
+    }
+    if !deleted_has_file_ext {
+        conn.execute("ALTER TABLE deleted_clips ADD COLUMN file_ext TEXT", [])?;
     }
 
     Ok(())
@@ -233,20 +288,100 @@ fn ensure_storage_dir(storage_path: &str) -> Result<String, String> {
     Ok(storage_path.to_string())
 }
 
-fn save_image_to_storage(storage_path: &str, image_data: &[u8], clip_id: &str) -> Result<String, String> {
+fn detect_image_format_bytes(image_bytes: &[u8]) -> ImageFormat {
+    image::guess_format(image_bytes).unwrap_or(ImageFormat::Png)
+}
+
+fn image_format_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::WebP => "webp",
+        ImageFormat::Pnm => "pnm",
+        ImageFormat::Tga => "tga",
+        ImageFormat::Dds => "dds",
+        ImageFormat::Farbfeld => "ff",
+        ImageFormat::Avif => "avif",
+        _ => "png",
+    }
+}
+
+fn compose_image_filename(source: &str, timestamp_millis: i64, sequence: u32, ext: &str) -> String {
+    let dt = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_millis).unwrap_or_else(Utc::now);
+    let ts = dt.format("%Y%m%d-%H%M%S").to_string();
+    let normalized_source = source
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let safe_source = if normalized_source.is_empty() {
+        "PPaste".to_string()
+    } else {
+        normalized_source
+    };
+
+    format!("{}-{}-{:03}.{}", safe_source, ts, sequence, ext)
+}
+
+fn generate_image_file_path(storage_path: &str, source: &str, ext: &str) -> Result<String, String> {
     ensure_storage_dir(storage_path)?;
-    let file_path = std::path::Path::new(storage_path).join(format!("{}.png", clip_id));
+
+    let now = Utc::now().timestamp_millis();
+    for seq in 1..=999 {
+        let file_name = compose_image_filename(source, now, seq, ext);
+        let candidate = std::path::Path::new(storage_path).join(file_name);
+        if !candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    Err("Failed to generate unique image filename".to_string())
+}
+
+fn save_image_to_storage(storage_path: &str, image_data: &[u8], source: &str) -> Result<(String, String), String> {
+    let format = detect_image_format_bytes(image_data);
+    let ext = image_format_extension(format).to_string();
+    let file_path = generate_image_file_path(storage_path, source, &ext)?;
     std::fs::write(&file_path, image_data).map_err(|e| format!("Failed to save image: {}", e))?;
-    Ok(file_path.to_string_lossy().to_string())
+    Ok((file_path, ext))
 }
 
 fn decode_image_clip(content: &str) -> Result<(Vec<u8>, usize, usize), String> {
-    let png_bytes = BASE64.decode(content).map_err(|e| format!("Failed to decode image data: {}", e))?;
-    let image = image::load_from_memory(&png_bytes)
+    let base64_data = content
+        .split_once(",")
+        .map(|(_, b64)| b64.to_string())
+        .unwrap_or_else(|| content.to_string());
+    let image_bytes = BASE64.decode(base64_data).map_err(|e| format!("Failed to decode image data: {}", e))?;
+    let image = image::load_from_memory(&image_bytes)
         .map_err(|e| format!("Failed to parse image data: {}", e))?
         .to_rgba8();
     let (width, height) = image.dimensions();
     Ok((image.into_raw(), width as usize, height as usize))
+}
+
+fn encode_clipboard_image(image_data: &ImageData<'_>) -> Result<(Vec<u8>, String), String> {
+    use image::{ImageBuffer, Rgba};
+
+    let bytes_vec = image_data.bytes.to_vec();
+    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(
+        image_data.width as u32,
+        image_data.height as u32,
+        bytes_vec,
+    )
+    .ok_or_else(|| "Failed to decode clipboard image".to_string())?;
+
+    let mut encoded = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut encoded);
+    img.write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode image: {}", e))?;
+
+    let base64_data = BASE64.encode(&encoded);
+    Ok((encoded, base64_data))
 }
 
 // --- 剪贴板监控 ---
@@ -308,7 +443,7 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                                         let mut last_clip = state.last_clip.lock().unwrap();
                                         *last_clip = Some(text.clone());
                                     } else {
-                                        save_clip(&state, Some(&app), text, "text".to_string(), source);
+                                        save_clip(&state, Some(&app), text, "text".to_string(), source, None);
                                     }
                                 }
                             } else {
@@ -322,7 +457,7 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                                     let mut last_clip = state.last_clip.lock().unwrap();
                                     *last_clip = Some(text.clone());
                                 } else {
-                                    save_clip(&state, Some(&app), text, "text".to_string(), source);
+                                    save_clip(&state, Some(&app), text, "text".to_string(), source, None);
                                 }
                             }
                         }
@@ -354,27 +489,21 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                         if let Some(ref last) = *last_hash {
                             if last != &image_hash {
                                 drop(last_hash);
-                                // 保存为 PNG
-                                use image::{ImageBuffer, Rgba};
-                                let bytes_vec = image_data.bytes.to_vec();
-                                let img = ImageBuffer::<Rgba<u8>, _>::from_raw(
-                                    image_data.width as u32,
-                                    image_data.height as u32,
-                                    bytes_vec
-                                ).unwrap();
-                                let mut png_bytes = Vec::new();
-                                let mut cursor = std::io::Cursor::new(&mut png_bytes);
-                                img.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
-                                
-                                // Base64 编码
-                                let base64_data = BASE64.encode(&png_bytes);
+                                let base64_data = match encode_clipboard_image(&image_data) {
+                                    Ok((_image_bytes, base64_data)) => base64_data,
+                                    Err(err) => {
+                                        eprintln!("Failed to encode clipboard image: {}", err);
+                                        thread::sleep(Duration::from_millis(500));
+                                        continue;
+                                    }
+                                };
                                 let source = capture_frontmost_app_name().unwrap_or_else(|| "Clipboard".to_string());
                                 let ignore_source = {
                                     let settings = state.settings.lock().unwrap();
                                     settings.ignore_password_managers && is_password_manager_source(&source)
                                 };
                                 if !ignore_source {
-                                    save_clip(&state, Some(&app), base64_data, "image".to_string(), source);
+                                    save_clip(&state, Some(&app), base64_data, "image".to_string(), source, Some("png".to_string()));
                                 }
                                 
                                 // 更新哈希
@@ -383,26 +512,21 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                             }
                         } else {
                             drop(last_hash);
-                            // 保存第一张图片
-                            use image::{ImageBuffer, Rgba};
-                            let bytes_vec = image_data.bytes.to_vec();
-                            let img = ImageBuffer::<Rgba<u8>, _>::from_raw(
-                                image_data.width as u32,
-                                image_data.height as u32,
-                                bytes_vec
-                            ).unwrap();
-                            let mut png_bytes = Vec::new();
-                            let mut cursor = std::io::Cursor::new(&mut png_bytes);
-                            img.write_to(&mut cursor, image::ImageFormat::Png).unwrap();
-                            
-                            let base64_data = BASE64.encode(&png_bytes);
+                            let base64_data = match encode_clipboard_image(&image_data) {
+                                Ok((_image_bytes, base64_data)) => base64_data,
+                                Err(err) => {
+                                    eprintln!("Failed to encode clipboard image: {}", err);
+                                    thread::sleep(Duration::from_millis(500));
+                                    continue;
+                                }
+                            };
                             let source = capture_frontmost_app_name().unwrap_or_else(|| "Clipboard".to_string());
                             let ignore_source = {
                                 let settings = state.settings.lock().unwrap();
                                 settings.ignore_password_managers && is_password_manager_source(&source)
                             };
                             if !ignore_source {
-                                save_clip(&state, Some(&app), base64_data, "image".to_string(), source);
+                                save_clip(&state, Some(&app), base64_data, "image".to_string(), source, Some("png".to_string()));
                             }
                             
                             let mut last_hash_mut = state.last_image_hash.lock().unwrap();
@@ -418,8 +542,8 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
-fn save_clip(state: &AppState, app: Option<&tauri::AppHandle>, content: String, clip_type: String, source: String) {
-    save_clip_with_path(state, app, content, clip_type, source, None);
+fn save_clip(state: &AppState, app: Option<&tauri::AppHandle>, content: String, clip_type: String, source: String, file_ext: Option<String>) {
+    save_clip_with_path(state, app, content, clip_type, source, None, file_ext);
 }
 
 fn clip_signature(content: &str, clip_type: &str) -> u64 {
@@ -439,6 +563,7 @@ fn save_clip_with_path(
     clip_type: String,
     source: String,
     file_path: Option<String>,
+    file_ext: Option<String>,
 ) {
     let mut last_clip = state.last_clip.lock().unwrap();
     *last_clip = Some(content.clone());
@@ -458,7 +583,7 @@ fn save_clip_with_path(
     let conn = state.db.lock().unwrap();
     let existing_clip = conn
         .query_row(
-            "SELECT id, clip_type, category, content, preview, timestamp, source
+            "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext
              FROM clips
              WHERE clip_type = ?1 AND content = ?2
              ORDER BY timestamp DESC
@@ -473,6 +598,7 @@ fn save_clip_with_path(
                     preview: row.get(4)?,
                     timestamp: row.get(5)?,
                     source: row.get(6)?,
+                    file_ext: row.get(7)?,
                 })
             },
         )
@@ -486,9 +612,9 @@ fn save_clip_with_path(
 
             if let Err(e) = conn.execute(
                 "UPDATE clips
-                 SET category = ?1, timestamp = ?2, source = ?3, file_path = COALESCE(?4, file_path)
+                 SET category = ?1, timestamp = ?2, source = ?3, file_path = COALESCE(?4, file_path), file_ext = COALESCE(?5, file_ext)
                  WHERE id = ?5",
-                params![clip.category, clip.timestamp, clip.source, file_path, clip.id],
+                params![clip.category, clip.timestamp, clip.source, file_path, file_ext, clip.id],
             ) {
                 eprintln!("Failed to promote existing clip: {}", e);
                 return;
@@ -523,12 +649,13 @@ fn save_clip_with_path(
                 preview: None,
                 timestamp,
                 source: Some(source),
+                file_ext: file_ext.clone(),
             };
 
             eprintln!("insert clip: type={} source={}", clip.clip_type, clip.source.clone().unwrap_or_default());
             if let Err(e) = conn.execute(
-                "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     clip.id,
                     clip.clip_type,
@@ -537,7 +664,8 @@ fn save_clip_with_path(
                     clip.preview,
                     clip.timestamp,
                     clip.source,
-                    file_path
+                    file_path,
+                    clip.file_ext
                 ],
             ) {
                 eprintln!("Failed to insert clip: {}", e);
@@ -687,6 +815,16 @@ fn cleanup_history(state: &AppState) {
             params![settings.max_clips],
         );
     }
+
+    if settings.recycle_bin_retention_days > 0 {
+        let recycle_cutoff = Utc::now()
+            .timestamp_millis()
+            - (settings.recycle_bin_retention_days as i64 * 24 * 60 * 60 * 1000);
+        let _ = conn.execute(
+            "DELETE FROM deleted_clips WHERE deleted_at < ?1",
+            params![recycle_cutoff],
+        );
+    }
 }
 
 fn normalize_shortcut(input: &str) -> String {
@@ -709,7 +847,7 @@ fn normalize_shortcut(input: &str) -> String {
 fn write_clip_to_system_clipboard(state: &AppState, content: &str, clip_type: &str) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
-    if clip_type == "text" {
+    if clip_type == "text" || clip_type == "image" {
         clipboard.set_text(content).map_err(|e| e.to_string())?;
         let mut suppressed_text = state.suppressed_text.lock().unwrap();
         *suppressed_text = Some(content.to_string());
@@ -857,7 +995,7 @@ fn quick_paste_latest_clip(state: &Arc<AppState>) -> Result<(), String> {
 
     write_clip_to_system_clipboard(state.as_ref(), &content, &clip_type)?;
 
-    if clip_type == "text" {
+    if clip_type == "text" || clip_type == "image" {
         thread::spawn(move || {
             if let Err(err) = paste_active_app(target_bundle_id) {
                 eprintln!("Failed to quick paste latest clip: {}", err);
@@ -893,13 +1031,10 @@ fn paste_active_app(target_bundle_id: Option<String>) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn paste_active_app(_target_bundle_id: Option<String>) -> Result<(), String> {
+    let script = "$wshell = New-Object -ComObject WScript.Shell; $ok = $false; for ($i = 0; $i -lt 4; $i++) {   Start-Sleep -Milliseconds (70 + 45 * $i);   try { $wshell.SendKeys('^v'); $ok = $true; break } catch {} }; if (-not $ok) { exit 1 }";
+
     let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$wshell = New-Object -ComObject WScript.Shell; Start-Sleep -Milliseconds 40; $wshell.SendKeys('^v')",
-        ])
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| format!("Failed to execute paste shortcut: {}", e))?;
 
@@ -1034,10 +1169,10 @@ fn apply_clear_history_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut
 fn get_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec<Clip> {
     let conn = state.db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, clip_type, category, content, preview, timestamp, source
+        "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext
          FROM clips ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
     ).unwrap();
-    
+
     let clips = stmt.query_map(params![limit, offset], |row| {
         Ok(Clip {
             id: row.get(0)?,
@@ -1047,9 +1182,43 @@ fn get_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec
             preview: row.get(4)?,
             timestamp: row.get(5)?,
             source: row.get(6)?,
+            file_ext: row.get(7)?,
         })
     }).unwrap();
-    
+
+    let mut result = Vec::new();
+    for clip in clips {
+        result.push(clip.unwrap());
+    }
+    result
+}
+
+#[tauri::command]
+fn get_deleted_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec<DeletedClip> {
+    let conn = state.db.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext, deleted_at
+             FROM deleted_clips ORDER BY deleted_at DESC LIMIT ?1 OFFSET ?2",
+        )
+        .unwrap();
+
+    let clips = stmt
+        .query_map(params![limit, offset], |row| {
+            Ok(DeletedClip {
+                id: row.get(0)?,
+                clip_type: row.get(1)?,
+                category: row.get(2)?,
+                content: row.get(3)?,
+                preview: row.get(4)?,
+                timestamp: row.get(5)?,
+                source: row.get(6)?,
+                file_ext: row.get(7)?,
+                deleted_at: row.get(8)?,
+            })
+        })
+        .unwrap();
+
     let mut result = Vec::new();
     for clip in clips {
         result.push(clip.unwrap());
@@ -1060,7 +1229,94 @@ fn get_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec
 #[tauri::command]
 fn delete_clip(state: tauri::State<Arc<AppState>>, id: String) -> Result<(), String> {
     let conn = state.db.lock().unwrap();
+    let deleted_at = Utc::now().timestamp_millis();
+
+    let moved = conn
+        .execute(
+            "INSERT INTO deleted_clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext, deleted_at)
+             SELECT id, clip_type, category, content, preview, timestamp, source, file_path, file_ext, ?2
+             FROM clips WHERE id = ?1",
+            params![id, deleted_at],
+        )
+        .map_err(|e| e.to_string())?;
+
+    if moved == 0 {
+        return Err("Clip not found".to_string());
+    }
+
     conn.execute("DELETE FROM clips WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+
+    drop(conn);
+    cleanup_history(state.inner().as_ref());
+    Ok(())
+}
+
+#[tauri::command]
+fn restore_deleted_clip(state: tauri::State<Arc<AppState>>, id: String) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+
+    let deleted_item: Option<(String, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT clip_type, category, content, preview, source, file_path, file_ext FROM deleted_clips WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let Some((clip_type, category, content, preview, source, file_path, file_ext)) = deleted_item else {
+        return Err("Deleted clip not found".to_string());
+    };
+
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    let restore_id = if exists { Uuid::new_v4().to_string() } else { id.clone() };
+    let restored_timestamp = Utc::now().timestamp_millis();
+
+    conn.execute(
+        "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            restore_id,
+            clip_type,
+            category,
+            content,
+            preview,
+            restored_timestamp,
+            source,
+            file_path,
+            file_ext
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute("DELETE FROM deleted_clips WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+
+    drop(conn);
+    cleanup_history(state.inner().as_ref());
+    Ok(())
+}
+
+#[tauri::command]
+fn permanently_delete_clip(state: tauri::State<Arc<AppState>>, id: String) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    conn.execute("DELETE FROM deleted_clips WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_deleted_clips(state: tauri::State<Arc<AppState>>) -> Result<(), String> {
+    let conn = state.db.lock().unwrap();
+    conn.execute("DELETE FROM deleted_clips", [])
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1081,14 +1337,43 @@ fn write_to_clipboard(state: tauri::State<Arc<AppState>>, content: String, clip_
 #[tauri::command]
 fn paste_clip(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, content: String, clip_type: String) -> Result<(), String> {
     let target_bundle_id = state.last_frontmost_app.lock().unwrap().clone();
+    let should_direct_paste = clip_type == "text";
     write_to_clipboard(state, content, clip_type)?;
-    hide_window(app)?;
-    thread::spawn(move || {
-        if let Err(err) = paste_active_app(target_bundle_id) {
-            eprintln!("Failed to paste into active app: {}", err);
-        }
-    });
+    if should_direct_paste {
+        hide_window(app)?;
+        thread::spawn(move || {
+            if let Err(err) = paste_active_app(target_bundle_id) {
+                eprintln!("Failed to paste into active app: {}", err);
+            }
+        });
+    }
     Ok(())
+}
+
+fn tray_menu_labels(language: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    if language.eq_ignore_ascii_case("en") {
+        ("Open Clipboard", "Pause Recording", "Settings", "Quit PPaste")
+    } else {
+        ("打开剪贴板", "暂停记录", "设置", "退出 PPaste")
+    }
+}
+
+fn build_tray_menu(app: &AppHandle, language: &str) -> Result<Menu<tauri::Wry>, tauri::Error> {
+    let (show_label, pause_label, settings_label, quit_label) = tray_menu_labels(language);
+    let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, "pause", pause_label, true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", settings_label, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
+    Menu::with_items(app, &[&show, &pause, &settings, &quit])
+}
+
+fn update_tray_menu_language(app: &AppHandle, state: &Arc<AppState>, language: &str) -> Result<(), String> {
+    let tray = app
+        .tray_by_id(&state.tray_id)
+        .ok_or_else(|| "Tray icon not found".to_string())?;
+
+    let menu = build_tray_menu(app, language).map_err(|e| e.to_string())?;
+    tray.set_menu(Some(menu)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1097,7 +1382,7 @@ fn get_settings(state: tauri::State<Arc<AppState>>) -> Settings {
 }
 
 #[tauri::command]
-fn update_settings(state: tauri::State<Arc<AppState>>, settings: Settings) -> Result<(), String> {
+fn update_settings(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, settings: Settings) -> Result<(), String> {
     let next_settings = settings.clone();
     {
         let mut current_settings = state.settings.lock().unwrap();
@@ -1113,6 +1398,9 @@ fn update_settings(state: tauri::State<Arc<AppState>>, settings: Settings) -> Re
     let conn = state.db.lock().unwrap();
     persist_settings(&conn, &next_settings)?;
     drop(conn);
+
+    let _ = update_tray_menu_language(&app, state.inner(), &next_settings.language);
+
     cleanup_history(state.inner().as_ref());
     Ok(())
 }
@@ -1319,7 +1607,7 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
     let storage_path = settings.storage_path.clone();
     drop(settings);
     
-    let clip_id = Uuid::new_v4().to_string();
+    
     
     // 跨平台截图支持
     #[cfg(target_os = "macos")]
@@ -1346,11 +1634,11 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
             let png_bytes = std::fs::read(temp_path).map_err(|e| e.to_string())?;
             
             // 保存到存储路径
-            let file_path = save_image_to_storage(&storage_path, &png_bytes, &clip_id)?;
+            let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
             let base64_data = BASE64.encode(&png_bytes);
             
             // 保存到历史（同时记录文件路径）
-            save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "Screenshot".to_string(), Some(file_path));
+            save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(file_path), Some(file_ext));
             
             // 清理临时文件
             let _ = std::fs::remove_file(temp_path);
@@ -1360,7 +1648,7 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
                 let _ = show_main_window(app);
             }
             
-            return Ok(base64_data);
+            return Ok(format!("data:image/png;base64,{}", base64_data));
         } else {
             if should_restore_window {
                 #[cfg(target_os = "macos")]
@@ -1475,7 +1763,7 @@ $bitmap.Dispose()
             full_png
         };
 
-        let file_path = save_image_to_storage(&storage_path, &png_bytes, &clip_id)?;
+        let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
         let base64_data = BASE64.encode(&png_bytes);
 
         save_clip_with_path(
@@ -1483,15 +1771,16 @@ $bitmap.Dispose()
             Some(app),
             base64_data.clone(),
             "image".to_string(),
-            "Screenshot".to_string(),
+            "PPaste".to_string(),
             Some(file_path),
+            Some(file_ext),
         );
 
         if should_restore_window {
             let _ = show_main_window(app);
         }
 
-        return Ok(base64_data);
+        return Ok(format!("data:image/png;base64,{}", base64_data));
     }
 
     #[cfg(target_os = "linux")]
@@ -1506,16 +1795,16 @@ $bitmap.Dispose()
         match output {
             Ok(out) if out.status.success() => {
                 let png_bytes = std::fs::read(temp_path).map_err(|e| e.to_string())?;
-                let file_path = save_image_to_storage(&storage_path, &png_bytes, &clip_id)?;
+                let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
                 let base64_data = BASE64.encode(&png_bytes);
                 
-                save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "Screenshot".to_string(), Some(file_path));
+                save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(file_path), Some(file_ext));
                 let _ = std::fs::remove_file(temp_path);
                 if should_restore_window {
                     let _ = show_main_window(app);
                 }
                 
-                return Ok(base64_data);
+                return Ok(format!("data:image/png;base64,{}", base64_data));
             }
             _ => {
                 // 回退到 gnome-screenshot
@@ -1526,16 +1815,16 @@ $bitmap.Dispose()
                 
                 if output2.status.success() {
                     let png_bytes = std::fs::read(temp_path).map_err(|e| e.to_string())?;
-                    let file_path = save_image_to_storage(&storage_path, &png_bytes, &clip_id)?;
+                    let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
                     let base64_data = BASE64.encode(&png_bytes);
                     
-                    save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "Screenshot".to_string(), Some(file_path));
+                    save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(file_path), Some(file_ext));
                     let _ = std::fs::remove_file(temp_path);
                     if should_restore_window {
                         let _ = show_main_window(app);
                     }
                     
-                    return Ok(base64_data);
+                    return Ok(format!("data:image/png;base64,{}", base64_data));
                 } else {
                     if should_restore_window {
                         let _ = show_main_window(app);
@@ -1563,32 +1852,15 @@ fn take_screenshot(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) ->
 #[tauri::command]
 fn save_image_from_clipboard(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) -> Result<String, String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
-    
+
     match clipboard.get_image() {
         Ok(image_data) => {
-            use image::{ImageBuffer, Rgba};
-            
-            let bytes_vec = image_data.bytes.to_vec();
-            let img = ImageBuffer::<Rgba<u8>, _>::from_raw(
-                image_data.width as u32,
-                image_data.height as u32,
-                bytes_vec
-            ).ok_or("Failed to decode image")?;
-            
-            // 保存为 PNG
-            let mut png_bytes = Vec::new();
-            let mut cursor = std::io::Cursor::new(&mut png_bytes);
-            img.write_to(&mut cursor, image::ImageFormat::Png)
-                .map_err(|e| format!("Failed to encode image: {}", e))?;
-            
-            let base64_data = BASE64.encode(&png_bytes);
-            
-            // 保存到历史
-            save_clip(&state, Some(&app), base64_data.clone(), "image".to_string(), "Clipboard".to_string());
-            
-            Ok(base64_data)
+            let (image_bytes, base64_data) = encode_clipboard_image(&image_data)?;
+            save_clip(&state, Some(&app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(image_format_extension(detect_image_format_bytes(&image_bytes)).to_string()));
+            let mime = format!("image/{}", image_format_extension(detect_image_format_bytes(&image_bytes)));
+            Ok(format!("data:{};base64,{}", mime, base64_data))
         }
-        Err(e) => Err(format!("No image in clipboard: {}", e))
+        Err(e) => Err(format!("No image in clipboard: {}", e)),
     }
 }
 
@@ -1607,12 +1879,14 @@ fn get_image_data(clip_id: String, state: tauri::State<Arc<AppState>>) -> Result
 
 #[tauri::command]
 fn export_image(clip_id: String, file_path: String, state: tauri::State<Arc<AppState>>) -> Result<(), String> {
-    let base64_data = get_image_data(clip_id, state)?;
-    
-    let png_bytes = BASE64.decode(&base64_data).map_err(|e| e.to_string())?;
-    
-    std::fs::write(&file_path, png_bytes).map_err(|e| e.to_string())?;
-    
+    let raw = get_image_data(clip_id, state)?;
+    let base64_data = raw
+        .split_once(",")
+        .map(|(_, b64)| b64.to_string())
+        .unwrap_or(raw);
+
+    let image_bytes = BASE64.decode(&base64_data).map_err(|e| e.to_string())?;
+    std::fs::write(&file_path, image_bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1633,7 +1907,7 @@ fn export_clips(state: tauri::State<Arc<AppState>>, file_path: String) -> Result
     
     // 获取所有剪贴板记录
     let mut stmt = conn.prepare(
-        "SELECT id, clip_type, category, content, preview, timestamp, source FROM clips ORDER BY timestamp DESC"
+        "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext FROM clips ORDER BY timestamp DESC"
     ).map_err(|e| e.to_string())?;
     
     let clips = stmt.query_map([], |row| {
@@ -1645,6 +1919,7 @@ fn export_clips(state: tauri::State<Arc<AppState>>, file_path: String) -> Result
             preview: row.get(4)?,
             timestamp: row.get(5)?,
             source: row.get(6)?,
+            file_ext: row.get(7)?,
         })
     }).map_err(|e| e.to_string())?;
     
@@ -1714,7 +1989,7 @@ fn export_clips_json(state: tauri::State<Arc<AppState>>) -> Result<String, Strin
     let settings = state.settings.lock().unwrap();
 
     let mut stmt = conn
-        .prepare("SELECT id, clip_type, category, content, preview, timestamp, source FROM clips ORDER BY timestamp DESC")
+        .prepare("SELECT id, clip_type, category, content, preview, timestamp, source, file_ext FROM clips ORDER BY timestamp DESC")
         .map_err(|e| e.to_string())?;
 
     let clips = stmt
@@ -1727,6 +2002,7 @@ fn export_clips_json(state: tauri::State<Arc<AppState>>) -> Result<String, Strin
                 preview: row.get(4)?,
                 timestamp: row.get(5)?,
                 source: row.get(6)?,
+                file_ext: row.get(7)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1850,6 +2126,7 @@ pub fn run() {
         last_frontmost_app: Arc::new(Mutex::new(None)),
         duplicate_hit_counts: Arc::new(Mutex::new(HashMap::new())),
         auto_pinned_signature: Arc::new(Mutex::new(None)),
+        tray_id: "main-tray".to_string(),
     });
     cleanup_history(&app_state);
     
@@ -1865,16 +2142,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state.clone())
         .setup(move |app| {
-            // 创建托盘菜单
-            let show = MenuItem::with_id(app, "show", "打开剪贴板 / Open Clipboard", true, None::<&str>)?;
-            let pause = MenuItem::with_id(app, "pause", "暂停记录 / Pause Recording", true, None::<&str>)?;
-            let settings = MenuItem::with_id(app, "settings", "设置 / Settings", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出 PPaste / Quit PPaste", true, None::<&str>)?;
-            
-            let menu = Menu::with_items(app, &[&show, &pause, &settings, &quit])?;
-            
+            // 创建托盘菜单（跟随当前语言）
+            let language = app_state
+                .settings
+                .lock()
+                .map(|s| s.language.clone())
+                .unwrap_or_else(|_| "zh".to_string());
+            let menu = build_tray_menu(app.handle(), &language)?;
+
             // 创建托盘图标
-            let _tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::with_id(&app_state.tray_id)
                 .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?)
                 .icon_as_template(true)
                 .menu(&menu)
@@ -1993,7 +2270,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_clips,
+            get_deleted_clips,
             delete_clip,
+            restore_deleted_clip,
+            permanently_delete_clip,
+            clear_deleted_clips,
             clear_all_clips,
             write_to_clipboard,
             paste_clip,

@@ -14,17 +14,21 @@ import {
   Link as LinkIcon,
   Maximize2,
   Monitor,
+  CheckSquare,
   Pin,
   Search,
   Settings,
+  Square,
   Trash2,
   X,
 } from 'lucide-react';
 import {
   clearAllClips,
+  clearDeletedClips,
   deleteClip,
   exportClips,
   getClips,
+  getDeletedClips,
   getRunAtLogin,
   getSettings,
   hideWindow,
@@ -32,6 +36,7 @@ import {
   listenToNewClip,
   listenToOpenSettings,
   pasteClip,
+  restoreDeletedClip,
   revealPath,
   setRunAtLogin,
   takeScreenshot,
@@ -43,11 +48,12 @@ import {
   type BackendSettings,
 } from '../lib/tauri';
 import { open, save } from '@tauri-apps/plugin-dialog';
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 type ThemeMode = 'dark' | 'light';
 type ThemePreference = ThemeMode | 'system';
 type Language = 'en' | 'zh';
-type ActiveCategory = 'all' | 'notes' | 'code' | 'links' | 'images' | 'files';
+type ActiveCategory = 'all' | 'notes' | 'code' | 'links' | 'images' | 'files' | 'recycle';
 
 type SelectOption = {
   label: string;
@@ -63,6 +69,7 @@ interface ClipView {
   preview?: string;
   timestamp: number;
   source?: string;
+  fileExt?: string;
   isPinned: boolean;
 }
 
@@ -191,11 +198,12 @@ function mapClip(clip: BackendClip, pinnedClipIds: string[], autoPinnedClipId: s
     resolvedCategory: resolveClipCategory(clip),
     content: clip.content,
     preview:
-      clip.clip_type === 'image' && clip.content && !clip.content.startsWith('data:')
-        ? `data:image/png;base64,${clip.content}`
+      clip.clip_type === 'image' && clip.content
+        ? (clip.content.startsWith('data:') ? clip.content : `data:image/png;base64,${clip.content}`)
         : clip.preview,
-    timestamp: clip.timestamp,
+    timestamp: clip.deleted_at ?? clip.timestamp,
     source: normalizeSource(clip.source),
+    fileExt: clip.file_ext?.toLowerCase(),
     isPinned: pinnedClipIds.includes(clip.id) || autoPinnedClipId === clip.id,
   };
 }
@@ -280,13 +288,15 @@ function categoryBadge(clip: ClipView, language: Language) {
 }
 
 function imageClipTitle(clip: ClipView, language: Language) {
-  if (clip.source === 'Screenshot') {
-    return language === 'zh' ? '截图' : 'Screenshot';
-  }
   if (clip.source) {
-    return language === 'zh' ? `${clip.source} 图片` : `${clip.source} image`;
+    return language === 'zh' ? clip.source : clip.source;
   }
-  return language === 'zh' ? '图片内容' : 'Image clip';
+  return language === 'zh' ? 'PPaste' : 'PPaste';
+}
+
+function getImageExtLabel(clip: ClipView) {
+  if (!clip.fileExt) return 'PNG';
+  return clip.fileExt.toUpperCase();
 }
 
 const TRANSLATIONS = {
@@ -336,6 +346,13 @@ const TRANSLATIONS = {
     links: 'Links',
     images: 'Images',
     files: 'Files',
+    recycleBin: 'Recycle Bin',
+    recycleBinRetention: 'Recycle Bin Retention',
+    restore: 'Restore',
+    recycleCleared: 'Recycle bin cleared',
+    restoredClip: 'Clip restored',
+    clearRecycleBin: 'Clear Recycle Bin',
+    noRecycleClips: 'No deleted clips',
     days1: '1 Day',
     days7: '7 Days',
     days30: '30 Days',
@@ -348,7 +365,16 @@ const TRANSLATIONS = {
     copiedToClipboard: 'Copied to clipboard',
     pastedToApp: 'Pasted into active app',
     deleted: 'Clip deleted',
+    deletedMultiple: '{count} clips deleted',
     failed: 'Action failed',
+    selectClip: 'Select',
+    selectedCount: '{count} selected',
+    clearSelection: 'Clear',
+    startMultiSelect: 'Multi-select',
+    finishMultiSelect: 'Done',
+    dragSelectHint: 'Drag to select',
+    delete: 'Delete',
+    deleteSelected: 'Delete Selected',
     dataManagement: 'Data Management',
     theme: 'Theme',
     system: 'System',
@@ -418,6 +444,13 @@ const TRANSLATIONS = {
     links: '链接',
     images: '图片',
     files: '文件',
+    recycleBin: '回收站',
+    recycleBinRetention: '回收站保留时长',
+    restore: '恢复',
+    recycleCleared: '已清空回收站',
+    restoredClip: '已恢复记录',
+    clearRecycleBin: '清空回收站',
+    noRecycleClips: '暂无已删除记录',
     days1: '1 天',
     days7: '7 天',
     days30: '30 天',
@@ -430,7 +463,16 @@ const TRANSLATIONS = {
     copiedToClipboard: '已复制到剪贴板',
     pastedToApp: '已粘贴到当前应用',
     deleted: '已删除记录',
+    deletedMultiple: '已删除 {count} 条记录',
     failed: '操作失败，请重试',
+    selectClip: '选择',
+    selectedCount: '已选择 {count} 项',
+    clearSelection: '清空选择',
+    startMultiSelect: '多选',
+    finishMultiSelect: '完成',
+    dragSelectHint: '拖动可连续选择',
+    delete: '删除',
+    deleteSelected: '删除所选',
     dataManagement: '数据管理',
     theme: '主题',
     system: '跟随系统',
@@ -465,6 +507,7 @@ function buildDefaultSettings(): BackendSettings {
     play_sounds: false,
     show_shortcut_hints: true,
     history_retention_days: 30,
+    recycle_bin_retention_days: 30,
     max_clips: 500,
     ignore_password_managers: true,
     plain_text_only: false,
@@ -481,6 +524,7 @@ export default function DesktopEnvironment() {
   const [language, setLanguage] = useState<Language>('zh');
   const [settingsData, setSettingsData] = useState<BackendSettings | null>(null);
   const [clips, setClips] = useState<ClipView[]>([]);
+  const [deletedClips, setDeletedClips] = useState<ClipView[]>([]);
   const [recentQueries, setRecentQueries] = useState<string[]>(() => getStoredStringArray(RECENT_QUERIES_STORAGE_KEY));
   const [pinnedClipIds, setPinnedClipIds] = useState<string[]>(() => getStoredStringArray(PINNED_CLIPS_STORAGE_KEY));
   const [autoPinnedClipId, setAutoPinnedClipId] = useState<string | null>(null);
@@ -556,13 +600,19 @@ export default function DesktopEnvironment() {
   }, [settingsData?.play_sounds]);
 
   const syncData = useCallback(async () => {
-    const [clipRows, settingsRows, runAtLoginEnabled] = await Promise.all([getClips(500, 0), getSettings(), getRunAtLogin()]);
+    const [clipRows, deletedRows, settingsRows, runAtLoginEnabled] = await Promise.all([
+      getClips(500, 0),
+      getDeletedClips(500, 0),
+      getSettings(),
+      getRunAtLogin(),
+    ]);
     const effectiveSettings = { ...settingsRows, launch_at_login: runAtLoginEnabled };
     setSettingsData(effectiveSettings);
     setThemePreference((effectiveSettings.theme as ThemePreference) || 'system');
     setLanguage((effectiveSettings.language as Language) || 'zh');
     startTransition(() => {
       setClips(sortClips(clipRows.map((clip) => mapClip(clip, pinnedClipIds, autoPinnedClipId))));
+      setDeletedClips(sortClips(deletedRows.map((clip) => mapClip(clip, [], null))));
     });
   }, [autoPinnedClipId, pinnedClipIds]);
 
@@ -640,7 +690,7 @@ export default function DesktopEnvironment() {
   const handleClipAction = useCallback(
     async (clip: ClipView, mode: 'paste' | 'copy') => {
       try {
-        if (mode === 'paste' && clip.type === 'text') {
+        if (mode === 'paste' && (clip.type === 'text' || clip.type === 'image')) {
           await pasteClip(clip.content, clip.type);
           await playFeedbackTone();
           showToast(t.pastedToApp);
@@ -658,20 +708,37 @@ export default function DesktopEnvironment() {
     [playFeedbackTone, showToast, t.copiedToClipboard, t.failed, t.pastedToApp],
   );
 
-  const handleDeleteClip = useCallback(
-    async (id: string) => {
+  const handleDeleteClips = useCallback(
+    async (ids: string[]) => {
+      const uniqueIds = Array.from(new Set(ids));
+      if (uniqueIds.length === 0) return;
+
+      const idSet = new Set(uniqueIds);
       try {
-        await deleteClip(id);
-        setClips((prev) => prev.filter((clip) => clip.id !== id));
-        setPinnedClipIds((prev) => prev.filter((clipId) => clipId !== id));
-        if (autoPinnedClipId === id) setAutoPinnedClipId(null);
-        showToast(t.deleted);
+        const removing = clips.filter((clip) => idSet.has(clip.id)).map((clip) => ({ ...clip, isPinned: false }));
+        await Promise.all(uniqueIds.map((id) => deleteClip(id)));
+        setClips((prev) => prev.filter((clip) => !idSet.has(clip.id)));
+        setDeletedClips((prev) => sortClips([...removing, ...prev.filter((clip) => !idSet.has(clip.id))]).slice(0, 500));
+        setPinnedClipIds((prev) => prev.filter((clipId) => !idSet.has(clipId)));
+        setAutoPinnedClipId((prev) => (prev && idSet.has(prev) ? null : prev));
+        if (uniqueIds.length > 1) {
+          showToast(t.deletedMultiple.replace('{count}', String(uniqueIds.length)));
+        } else {
+          showToast(t.deleted);
+        }
       } catch (error) {
         console.error(error);
         showToast(t.failed, 'error');
       }
     },
-    [autoPinnedClipId, showToast, t.deleted, t.failed],
+    [clips, showToast, t.deleted, t.deletedMultiple, t.failed],
+  );
+
+  const handleDeleteClip = useCallback(
+    async (id: string) => {
+      await handleDeleteClips([id]);
+    },
+    [handleDeleteClips],
   );
 
   const handleTogglePinned = useCallback(
@@ -734,6 +801,31 @@ export default function DesktopEnvironment() {
     }
   }, [showToast, t.cleared, t.failed]);
 
+  const handleRestoreDeletedClip = useCallback(
+    async (id: string) => {
+      try {
+        await restoreDeletedClip(id);
+        await syncData();
+        showToast(t.restoredClip);
+      } catch (error) {
+        console.error(error);
+        showToast(t.failed, 'error');
+      }
+    },
+    [showToast, syncData, t.failed, t.restoredClip],
+  );
+
+  const handleClearRecycleBin = useCallback(async () => {
+    try {
+      await clearDeletedClips();
+      setDeletedClips([]);
+      showToast(t.recycleCleared);
+    } catch (error) {
+      console.error(error);
+      showToast(t.failed, 'error');
+    }
+  }, [showToast, t.failed, t.recycleCleared]);
+
   const handleTakeScreenshot = useCallback(async () => {
     try {
       await takeScreenshot();
@@ -780,6 +872,7 @@ export default function DesktopEnvironment() {
         {!isSettingsOpen && (
           <ClipboardPalette
             clips={clips}
+            deletedClips={deletedClips}
             language={language}
             theme={theme}
             panelOpacity={panelOpacity}
@@ -794,6 +887,8 @@ export default function DesktopEnvironment() {
             onPasteClip={(clip) => void handleClipAction(clip, 'paste')}
             onCopyClip={(clip) => void handleClipAction(clip, 'copy')}
             onDeleteClip={(id) => void handleDeleteClip(id)}
+                      onRestoreDeletedClip={(id) => void handleRestoreDeletedClip(id)}
+            onClearRecycleBin={() => void handleClearRecycleBin()}
             onTogglePinned={handleTogglePinned}
           />
         )}
@@ -828,6 +923,7 @@ export default function DesktopEnvironment() {
             onTogglePlaySounds={() => void patchSettings({ play_sounds: !settingsData.play_sounds })}
             onToggleShortcutHints={() => void patchSettings({ show_shortcut_hints: !settingsData.show_shortcut_hints })}
             onRetentionChange={(value) => void patchSettings({ history_retention_days: Number(value) })}
+            onRecycleRetentionChange={(value) => void patchSettings({ recycle_bin_retention_days: Number(value) })}
             onMaxClipsChange={(value) => void patchSettings({ max_clips: Number(value) })}
             onToggleIgnorePasswordManagers={() =>
               void patchSettings({ ignore_password_managers: !settingsData.ignore_password_managers })
@@ -850,10 +946,10 @@ export default function DesktopEnvironment() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 14, scale: 0.96 }}
             transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-            className={`pointer-events-none absolute bottom-[calc(10vh+54px)] left-1/2 z-[95] flex max-w-[min(560px,calc(100%-40px))] -translate-x-1/2 items-center gap-2 rounded-xl border px-4 py-2 text-sm font-medium backdrop-blur-md ${
+            className={`pointer-events-none absolute bottom-[calc(10vh+54px)] left-1/2 z-[95] flex max-w-[min(560px,calc(100%-40px))] -translate-x-1/2 items-center gap-2 rounded-xl border px-4 py-2 text-sm font-light backdrop-blur-md ${
               toastVariant === 'error'
                 ? 'border-red-500/25 bg-red-500/12 text-red-300'
-                : 'border-teal-500/25 bg-teal-500/12 text-teal-300'
+                : 'border-indigo-500/25 bg-indigo-500/12 text-indigo-300'
             }`}
           >
             {toastVariant === 'error' ? <AlertTriangle size={16} /> : <Check size={16} />}
@@ -867,6 +963,7 @@ export default function DesktopEnvironment() {
 
 function ClipboardPalette({
   clips,
+  deletedClips,
   language,
   theme,
   panelOpacity,
@@ -881,9 +978,12 @@ function ClipboardPalette({
   onPasteClip,
   onCopyClip,
   onDeleteClip,
+  onRestoreDeletedClip,
+  onClearRecycleBin,
   onTogglePinned,
 }: {
   clips: ClipView[];
+  deletedClips: ClipView[];
   language: Language;
   theme: ThemeMode;
   panelOpacity: number;
@@ -898,6 +998,8 @@ function ClipboardPalette({
   onPasteClip: (clip: ClipView) => void;
   onCopyClip: (clip: ClipView) => void;
   onDeleteClip: (id: string) => void;
+  onRestoreDeletedClip: (id: string) => void;
+  onClearRecycleBin: () => void;
   onTogglePinned: (id: string) => void;
 }) {
   const t = TRANSLATIONS[language];
@@ -909,24 +1011,22 @@ function ClipboardPalette({
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [quickLookItem, setQuickLookItem] = useState<ClipView | null>(null);
   const [keyboardNavigation, setKeyboardNavigation] = useState(false);
+  const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const hoveredClipIdRef = useRef<string | null>(null);
-  const closeQuickLook = useCallback(() => {
-    setQuickLookItem(null);
-    window.setTimeout(() => searchInputRef.current?.focus(), 0);
-  }, []);
-  const openQuickLook = useCallback((clip: ClipView) => {
-    setQuickLookItem(clip);
-  }, []);
+  const isDragSelectingRef = useRef(false);
+  const dragSelectTargetRef = useRef(false);
 
   const filteredClips = useMemo(() => {
-    return clips.filter((clip) => {
+    const source = activeCategory === 'recycle' ? deletedClips : clips;
+    return source.filter((clip) => {
       const matchesQuery =
         clip.content.toLowerCase().includes(deferredQuery.toLowerCase()) || clip.source?.toLowerCase().includes(deferredQuery.toLowerCase());
-      const matchesCategory = activeCategory === 'all' ? true : getCategoryBucket(clip) === activeCategory;
+      const matchesCategory = activeCategory === 'all' || activeCategory === 'recycle' ? true : getCategoryBucket(clip) === activeCategory;
       return matchesQuery && matchesCategory;
     });
-  }, [activeCategory, clips, deferredQuery]);
+  }, [activeCategory, clips, deferredQuery, deletedClips]);
 
   const saveQuery = useCallback(
     (value: string) => {
@@ -941,6 +1041,81 @@ function ClipboardPalette({
     [filteredClips, selectedIndex],
   );
 
+  const selectedClipSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
+
+  const setClipSelected = useCallback((clipId: string, selected: boolean) => {
+    setSelectedClipIds((prev) => {
+      const exists = prev.includes(clipId);
+      if (selected) {
+        return exists ? prev : [...prev, clipId];
+      }
+      return exists ? prev.filter((id) => id !== clipId) : prev;
+    });
+  }, []);
+
+  const toggleClipSelection = useCallback((clipId: string) => {
+    setSelectedClipIds((prev) => (prev.includes(clipId) ? prev.filter((id) => id !== clipId) : [...prev, clipId]));
+  }, []);
+
+  const clearClipSelection = useCallback(() => {
+    setSelectedClipIds([]);
+    isDragSelectingRef.current = false;
+  }, []);
+
+  const startMultiSelect = useCallback(() => {
+    setIsMultiSelectMode(true);
+    setSelectedClipIds([]);
+  }, []);
+
+  const finishMultiSelect = useCallback(() => {
+    setIsMultiSelectMode(false);
+    setSelectedClipIds([]);
+    isDragSelectingRef.current = false;
+  }, []);
+
+  const handleDragSelectStart = useCallback(
+    (clipId: string) => {
+      if (!isMultiSelectMode) return;
+      const shouldSelect = !selectedClipSet.has(clipId);
+      isDragSelectingRef.current = true;
+      dragSelectTargetRef.current = shouldSelect;
+      setClipSelected(clipId, shouldSelect);
+    },
+    [isMultiSelectMode, selectedClipSet, setClipSelected],
+  );
+
+  const handleDragSelectEnter = useCallback(
+    (clipId: string) => {
+      if (!isMultiSelectMode || !isDragSelectingRef.current) return;
+      setClipSelected(clipId, dragSelectTargetRef.current);
+    },
+    [isMultiSelectMode, setClipSelected],
+  );
+
+  const openLinkInBrowser = useCallback(async (clip: ClipView | undefined) => {
+    if (!clip || !isLinkClip(clip)) return;
+    try {
+      await openUrl(clip.content.trim());
+    } catch (error) {
+      console.error(error);
+      onCopyClip(clip);
+    }
+  }, [onCopyClip]);
+
+  const closeQuickLook = useCallback(() => {
+    setQuickLookItem(null);
+    window.setTimeout(() => searchInputRef.current?.focus(), 0);
+  }, []);
+
+  const openQuickLook = useCallback((clip: ClipView) => {
+    if (activeCategory === 'recycle') return;
+    if (isLinkClip(clip)) {
+      void openLinkInBrowser(clip);
+      return;
+    }
+    setQuickLookItem(clip);
+  }, [activeCategory, openLinkInBrowser]);
+
   useEffect(() => {
     setSelectedIndex(0);
     hoveredClipIdRef.current = null;
@@ -948,11 +1123,36 @@ function ClipboardPalette({
   }, [activeCategory, query, showSuggestions]);
 
   useEffect(() => {
+    if (activeCategory === 'recycle') {
+      setIsMultiSelectMode(false);
+    }
+    setSelectedClipIds([]);
+  }, [activeCategory]);
+
+  useEffect(() => {
+    const stopDragSelect = () => {
+      isDragSelectingRef.current = false;
+    };
+
+    window.addEventListener('mouseup', stopDragSelect);
+    window.addEventListener('blur', stopDragSelect);
+    return () => {
+      window.removeEventListener('mouseup', stopDragSelect);
+      window.removeEventListener('blur', stopDragSelect);
+    };
+  }, []);
+
+  useEffect(() => {
     const current = filteredClips[selectedIndex];
     if (!current) return;
     const node = document.querySelector<HTMLElement>(`[data-clip-id="${current.id}"]`);
     node?.scrollIntoView({ block: 'nearest' });
   }, [filteredClips, selectedIndex]);
+
+  useEffect(() => {
+    const existingIds = new Set(clips.map((clip) => clip.id));
+    setSelectedClipIds((prev) => prev.filter((id) => existingIds.has(id)));
+  }, [clips]);
 
   useEffect(() => {
     if (!focusedClipId) return;
@@ -1013,11 +1213,22 @@ function ClipboardPalette({
 
         const selected = getActiveClip();
         if (selected) {
-          saveQuery(query);
-          onPasteClip(selected);
+          if (activeCategory === 'recycle') {
+            onRestoreDeletedClip(selected.id);
+          } else if (isMultiSelectMode) {
+            toggleClipSelection(selected.id);
+          } else {
+            saveQuery(query);
+            onPasteClip(selected);
+          }
         }
       } else if (event.code === 'Space' && (document.activeElement?.tagName !== 'INPUT' || query.trim().length === 0)) {
         event.preventDefault();
+        if (isMultiSelectMode) {
+          const selected = getActiveClip();
+          if (selected) toggleClipSelection(selected.id);
+          return;
+        }
         if (quickLookItem) {
           closeQuickLook();
         } else {
@@ -1028,6 +1239,12 @@ function ClipboardPalette({
         event.preventDefault();
         if (quickLookItem) {
           closeQuickLook();
+        } else if (isMultiSelectMode) {
+          if (selectedClipIds.length > 0) {
+            clearClipSelection();
+          } else {
+            finishMultiSelect();
+          }
         } else if (showSuggestions) {
           setShowSuggestions(false);
         } else {
@@ -1038,7 +1255,28 @@ function ClipboardPalette({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [closeQuickLook, getActiveClip, isMac, onClose, onCopyClip, onOpenSettings, onPasteClip, openQuickLook, query, quickLookItem, recentQueries, saveQuery, selectedIndex, showSuggestions]);
+  }, [
+    clearClipSelection,
+    closeQuickLook,
+    getActiveClip,
+    activeCategory,
+    isMac,
+    isMultiSelectMode,
+    onClose,
+    onCopyClip,
+    onOpenSettings,
+    onPasteClip,
+    onRestoreDeletedClip,
+    openQuickLook,
+    query,
+    quickLookItem,
+    finishMultiSelect,
+    recentQueries,
+    saveQuery,
+    selectedClipIds.length,
+    selectedIndex,
+    showSuggestions,
+  ]);
 
   const categories = [
     { id: 'all', label: t.all },
@@ -1047,6 +1285,7 @@ function ClipboardPalette({
     { id: 'links', label: t.links },
     { id: 'images', label: t.images },
     { id: 'files', label: t.files },
+    { id: 'recycle', label: t.recycleBin },
   ] as const;
 
   return (
@@ -1116,7 +1355,7 @@ function ClipboardPalette({
               <button
                 key={category.id}
                 onClick={() => setActiveCategory(category.id)}
-                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${
                   activeCategory === category.id
                     ? 'bg-indigo-500 text-white'
                     : theme === 'dark'
@@ -1127,6 +1366,28 @@ function ClipboardPalette({
                 {category.label}
               </button>
             ))}
+            {activeCategory !== 'recycle' ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (isMultiSelectMode) {
+                    finishMultiSelect();
+                  } else {
+                    startMultiSelect();
+                  }
+                }}
+                className={`ml-auto rounded-md p-1.5 transition-colors ${
+                  isMultiSelectMode
+                    ? 'bg-indigo-500/15 text-indigo-500'
+                    : theme === 'dark'
+                      ? 'text-neutral-500 hover:bg-white/10 hover:text-white'
+                      : 'text-neutral-400 hover:bg-black/5 hover:text-black'
+                }`}
+                title={isMultiSelectMode ? t.finishMultiSelect : t.startMultiSelect}
+              >
+                <CheckSquare size={16} />
+              </button>
+            ) : null}
           </div>
         </div>
 
@@ -1138,7 +1399,7 @@ function ClipboardPalette({
         >
           {showSuggestions ? (
             <div className="py-2">
-              <div className="flex items-center justify-between px-3 py-1 text-xs font-medium text-neutral-500">
+              <div className="flex items-center justify-between px-3 py-1 text-xs font-light text-neutral-500">
                 <span>{t.recentSearches}</span>
                 <button onClick={() => setRecentQueries([])} className="hover:text-neutral-400">
                   {t.clearSearches}
@@ -1163,7 +1424,7 @@ function ClipboardPalette({
                   }`}
                 >
                   <Clock size={14} className="opacity-50" />
-                  <span className="text-sm font-medium">{item}</span>
+                  <span className="text-sm font-light">{item}</span>
                 </button>
               ))}
             </div>
@@ -1179,11 +1440,68 @@ function ClipboardPalette({
               >
                 <Search size={40} className={theme === 'dark' ? 'text-neutral-600' : 'text-neutral-400'} />
               </motion.div>
-              <p className="text-sm font-medium">
+              <p className="text-sm font-light">
                 {t.noClips} {query ? `"${query}"` : ''}
               </p>
               <p className="mt-2 text-xs opacity-60">{t.emptyStateMsg}</p>
             </div>
+          ) : activeCategory === 'recycle' ? (
+            filteredClips.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+                <Trash2 size={36} className="mb-3 opacity-60" />
+                <p className="text-sm font-light">{t.noRecycleClips}</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className={`mb-2 flex items-center justify-between rounded-xl border px-3 py-2 text-xs font-light ${
+                  theme === 'dark' ? 'border-gray-800 bg-gray-900 text-gray-300' : 'border-gray-200 bg-gray-50 text-gray-700'
+                }`}>
+                  <span>{t.recycleBin}</span>
+                  <button
+                    type="button"
+                    onClick={onClearRecycleBin}
+                    className="rounded-lg bg-red-500 px-2 py-1 text-white transition-colors hover:bg-red-600"
+                  >
+                    {t.clearRecycleBin}
+                  </button>
+                </div>
+                {filteredClips.map((clip, index) => (
+                  <div
+                    key={clip.id}
+                    className={`flex items-center gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                      keyboardNavigation && index === selectedIndex
+                        ? theme === 'dark'
+                          ? 'border-indigo-500/50 bg-indigo-500/10'
+                          : 'border-indigo-300 bg-indigo-50'
+                        : theme === 'dark'
+                          ? 'border-white/10 bg-white/5 hover:bg-white/10'
+                          : 'border-black/10 bg-white hover:bg-gray-50'
+                    }`}
+                  >
+                    <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
+                      theme === 'dark' ? 'bg-white/10 text-neutral-400' : 'bg-black/5 text-neutral-500'
+                    }`}>
+                      <Trash2 size={14} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-light">{clip.content.split('\n')[0]}</div>
+                      <div className="mt-0.5 flex items-center gap-2 text-[10px] text-neutral-500">
+                        <span>{categoryBadge(clip, language)}</span>
+                        <span className="h-1 w-1 rounded-full bg-current/40" />
+                        <span>{formatRelativeTime(clip.timestamp, language)}</span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onRestoreDeletedClip(clip.id)}
+                      className="rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-light text-white transition-colors hover:bg-indigo-600"
+                    >
+                      {t.restore}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )
           ) : (
             filteredClips.map((clip, index) => (
               <ClipItem
@@ -1201,6 +1519,10 @@ function ClipboardPalette({
                   if (hoveredClipIdRef.current === clip.id) hoveredClipIdRef.current = null;
                 }}
                 onPaste={() => {
+                  if (isMultiSelectMode) {
+                    toggleClipSelection(clip.id);
+                    return;
+                  }
                   saveQuery(query);
                   onPasteClip(clip);
                 }}
@@ -1208,6 +1530,11 @@ function ClipboardPalette({
                 onCopy={() => onCopyClip(clip)}
                 onDelete={() => onDeleteClip(clip.id)}
                 onTogglePinned={() => onTogglePinned(clip.id)}
+                multiSelectMode={isMultiSelectMode}
+                isMultiSelected={selectedClipSet.has(clip.id)}
+                onToggleSelect={() => toggleClipSelection(clip.id)}
+                onSelectionDragStart={() => handleDragSelectStart(clip.id)}
+                onSelectionDragEnter={() => handleDragSelectEnter(clip.id)}
                 previewLabel={t.preview}
                 pinLabel={clip.isPinned ? t.unpin : t.pin}
               />
@@ -1217,24 +1544,44 @@ function ClipboardPalette({
 
         {showShortcutHints ? (
           <div
-            data-no-window-drag="true" className={`flex items-center justify-between border-t px-4 py-2 text-[11px] font-medium ${
+            data-no-window-drag="true" className={`flex items-center justify-between border-t px-4 py-2 text-[11px] font-light ${
               theme === 'dark' ? 'border-white/5 bg-black/20 text-neutral-500' : 'border-black/5 bg-black/5 text-neutral-500'
             }`}
           >
-            <div className="flex min-w-0 items-center gap-3">
-              <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
-              <ShortcutHint theme={theme} keys={['Enter']} label={t.paste} />
-              <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />
-            </div>
-            <div className="ml-4 flex min-w-0 items-center gap-3">
-              <ShortcutHint theme={theme} keys={isMac ? ['Option', 'S'] : ['Alt', 'S']} label={t.screenshotShortcut} />
-              <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
-            </div>
+            {isMultiSelectMode && activeCategory !== 'recycle' ? (
+              <>
+                <div className="flex min-w-0 items-center gap-3">
+                  <span className="truncate">{t.selectedCount.replace('{count}', String(selectedClipIds.length))}</span>
+                  <ShortcutHint theme={theme} keys={['Enter']} label={t.selectClip} />
+                  <ShortcutHint theme={theme} keys={['Del']} label={t.deleteSelected} />
+                </div>
+                <div className="ml-4 flex min-w-0 items-center gap-3">
+                  <ShortcutHint theme={theme} keys={['Esc']} label={t.finishMultiSelect} />
+                  <ShortcutHint theme={theme} keys={['X']} label={t.clearSelection} />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex min-w-0 items-center gap-3">
+                  <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
+                  <ShortcutHint
+                    theme={theme}
+                    keys={['Enter']}
+                    label={activeCategory === 'recycle' ? t.restore : t.paste}
+                  />
+                  {activeCategory === 'recycle' ? null : <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />}
+                </div>
+                <div className="ml-4 flex min-w-0 items-center gap-3">
+                  <ShortcutHint theme={theme} keys={isMac ? ['Option', 'S'] : ['Alt', 'S']} label={t.screenshotShortcut} />
+                  <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
+                </div>
+              </>
+            )}
           </div>
         ) : null}
 
         <AnimatePresence>
-          {quickLookItem ? <QuickLookItem clip={quickLookItem} language={language} theme={theme} onClose={closeQuickLook} /> : null}
+          {quickLookItem && activeCategory !== 'recycle' ? <QuickLookItem clip={quickLookItem} language={language} theme={theme} onClose={closeQuickLook} /> : null}
         </AnimatePresence>
       </motion.div>
     </div>
@@ -1295,7 +1642,7 @@ const QuickLookItem = memo(function QuickLookItem({
             ) : (
               <FileText size={16} className="text-indigo-500" />
             )}
-            <span className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-100' : 'text-neutral-900'}`}>{TRANSLATIONS[language].preview}</span>
+            <span className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-100' : 'text-neutral-900'}`}>{TRANSLATIONS[language].preview}</span>
           </div>
           <button
             onClick={onClose}
@@ -1322,7 +1669,7 @@ const QuickLookItem = memo(function QuickLookItem({
             <div className="flex h-full w-full min-h-[360px] flex-col gap-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <a href={clip.content} target="_blank" rel="noreferrer" className="block truncate text-sm font-medium text-indigo-500 hover:underline">
+                  <a href={clip.content} target="_blank" rel="noreferrer" className="block truncate text-sm font-light text-indigo-500 hover:underline">
                     {clip.content}
                   </a>
                   {clip.source ? <p className="mt-1 text-xs text-neutral-500">{clip.source}</p> : null}
@@ -1331,7 +1678,7 @@ const QuickLookItem = memo(function QuickLookItem({
                   href={clip.content}
                   target="_blank"
                   rel="noreferrer"
-                  className={`inline-flex h-8 flex-shrink-0 items-center rounded-lg px-3 text-xs font-medium transition-colors ${
+                  className={`inline-flex h-8 flex-shrink-0 items-center rounded-lg px-3 text-xs font-light transition-colors ${
                     theme === 'dark' ? 'bg-white/5 text-neutral-200 hover:bg-white/10' : 'bg-black/5 text-neutral-800 hover:bg-black/10'
                   }`}
                 >
@@ -1366,7 +1713,7 @@ const QuickLookItem = memo(function QuickLookItem({
                     href={clip.content}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex h-9 items-center rounded-lg bg-indigo-500 px-4 text-sm font-medium text-white transition-colors hover:bg-indigo-600"
+                    className="inline-flex h-9 items-center rounded-lg bg-indigo-500 px-4 text-sm font-light text-white transition-colors hover:bg-indigo-600"
                   >
                     {TRANSLATIONS[language].openInBrowser}
                   </a>
@@ -1379,7 +1726,7 @@ const QuickLookItem = memo(function QuickLookItem({
                 <FileText size={28} className="text-indigo-500" />
               </div>
               <div>
-                <div className="text-sm font-medium">{TRANSLATIONS[language].pathPreview}</div>
+                <div className="text-sm font-light">{TRANSLATIONS[language].pathPreview}</div>
                 <div className="mt-2 break-all font-mono text-xs text-neutral-500">{pathLikeContent}</div>
               </div>
               <button
@@ -1393,7 +1740,7 @@ const QuickLookItem = memo(function QuickLookItem({
                     setPathActionError(TRANSLATIONS[language].failed);
                   }
                 }}
-                className="inline-flex h-9 items-center rounded-lg bg-indigo-500 px-4 text-sm font-medium text-white transition-colors hover:bg-indigo-600"
+                className="inline-flex h-9 items-center rounded-lg bg-indigo-500 px-4 text-sm font-light text-white transition-colors hover:bg-indigo-600"
               >
                 {TRANSLATIONS[language].revealInFinder}
               </button>
@@ -1427,6 +1774,11 @@ const ClipItem = memo(function ClipItem({
   onCopy,
   onDelete,
   onTogglePinned,
+  multiSelectMode,
+  isMultiSelected,
+  onToggleSelect,
+  onSelectionDragStart,
+  onSelectionDragEnter,
   previewLabel,
   pinLabel,
 }: {
@@ -1442,14 +1794,22 @@ const ClipItem = memo(function ClipItem({
   onCopy: () => void;
   onDelete: () => void;
   onTogglePinned: () => void;
+  multiSelectMode: boolean;
+  isMultiSelected: boolean;
+  onToggleSelect: () => void;
+  onSelectionDragStart: () => void;
+  onSelectionDragEnter: () => void;
   previewLabel: string;
   pinLabel: string;
 }) {
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [copied, setCopied] = useState(false);
-  const metaParts = [clip.source, categoryBadge(clip, language), formatRelativeTime(clip.timestamp, language)].filter(
-    (value): value is string => Boolean(value),
-  );
+  const relativeTime = formatRelativeTime(clip.timestamp, language);
+  const metaParts = [
+    clip.source,
+    categoryBadge(clip, language),
+    clip.type === 'image' ? getImageExtLabel(clip) : undefined,
+    relativeTime,
+  ].filter((value): value is string => Boolean(value));
 
   const icon = useMemo(() => {
     if (getCategoryBucket(clip) === 'code') return <Code size={14} />;
@@ -1461,9 +1821,20 @@ const ClipItem = memo(function ClipItem({
   return (
     <div
       data-clip-id={clip.id}
-      onMouseEnter={onHoverStart}
+      onMouseDown={(event) => {
+        if (!multiSelectMode || event.button !== 0) return;
+        event.preventDefault();
+        onSelectionDragStart();
+      }}
+      onMouseEnter={() => {
+        onHoverStart();
+        if (multiSelectMode) onSelectionDragEnter();
+      }}
       onMouseLeave={onHoverEnd}
-      onClick={onPaste}
+      onClick={() => {
+        if (multiSelectMode) return;
+        onPaste();
+      }}
       className={`group relative flex h-16 cursor-pointer items-center gap-3 rounded-xl px-3 py-2 transition-colors ${
         isSelected
           ? theme === 'dark'
@@ -1474,6 +1845,27 @@ const ClipItem = memo(function ClipItem({
             : 'text-neutral-600 hover:bg-black/5'
       }`}
     >
+      {multiSelectMode ? (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onToggleSelect();
+          }}
+          className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded border transition-colors ${
+            isMultiSelected
+              ? 'border-indigo-500 bg-indigo-500 text-white'
+              : theme === 'dark'
+                ? 'border-gray-600 bg-transparent text-transparent hover:border-indigo-400'
+                : 'border-gray-300 bg-transparent text-transparent hover:border-indigo-500'
+          }`}
+          aria-label={TRANSLATIONS[language].selectClip}
+        >
+          {isMultiSelected ? <Check size={10} /> : <Square size={10} />}
+        </button>
+      ) : null}
+
       <div
         className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
           isSelected
@@ -1498,10 +1890,12 @@ const ClipItem = memo(function ClipItem({
             >
               <img src={clip.preview} alt="Preview" className="h-full w-full object-cover" referrerPolicy="no-referrer" loading="lazy" decoding="async" />
             </div>
-            <span className="truncate text-sm font-medium leading-5">{imageClipTitle(clip, language)}</span>
+            <div className="min-w-0">
+              <span className="block truncate text-sm font-light leading-5">{imageClipTitle(clip, language)}</span>
+            </div>
           </div>
         ) : (
-          <span className={`truncate leading-5 ${clip.type === 'text' && clip.content.includes('\n') ? 'font-mono text-xs' : 'text-sm font-medium'}`}>
+          <span className={`truncate leading-5 ${clip.type === 'text' && clip.content.includes('\n') ? 'font-mono text-xs' : 'text-sm font-light'}`}>
             {clip.content.split('\n')[0]}
           </span>
         )}
@@ -1522,7 +1916,7 @@ const ClipItem = memo(function ClipItem({
         </div>
       </div>
 
-      {!showDeleteConfirm ? (
+      {!multiSelectMode ? (
         <div
           className={`flex flex-shrink-0 items-center gap-1 ${
             isSelected ? 'opacity-100' : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100'
@@ -1535,90 +1929,63 @@ const ClipItem = memo(function ClipItem({
               onSelect();
               onTogglePinned();
             }}
-            className={`rounded-md p-1.5 transition-colors ${
-              clip.isPinned
-                ? 'bg-indigo-500/10 text-indigo-500'
-                : theme === 'dark'
-                  ? 'text-neutral-400 hover:bg-white/10 hover:text-white'
-                  : 'text-neutral-500 hover:bg-black/5 hover:text-black'
-            }`}
-            title={pinLabel}
-          >
-            <Pin size={14} className={clip.isPinned ? 'fill-current' : ''} />
-          </button>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              onSelect();
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 2000);
-              onCopy();
-            }}
-            className={`rounded-md p-1.5 transition-colors ${
-              copied
-                ? 'bg-emerald-500/10 text-emerald-500'
-                : theme === 'dark'
-                  ? 'text-neutral-400 hover:bg-white/10 hover:text-white'
-                  : 'text-neutral-500 hover:bg-black/5 hover:text-black'
-            }`}
-            title={TRANSLATIONS[language].copy}
-          >
-            {copied ? <Check size={14} /> : <Copy size={14} />}
-          </button>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              onSelect();
-              onPreview();
-            }}
-            className={`rounded-md p-1.5 transition-colors ${
-              theme === 'dark' ? 'text-neutral-400 hover:bg-white/10 hover:text-white' : 'text-neutral-500 hover:bg-black/5 hover:text-black'
-            }`}
-            title={previewLabel}
-          >
-            <Maximize2 size={14} />
-          </button>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              onSelect();
-              setShowDeleteConfirm(true);
-            }}
-            className={`rounded-md p-1.5 transition-colors ${
-              theme === 'dark' ? 'text-neutral-400 hover:bg-red-500/20 hover:text-red-400' : 'text-neutral-500 hover:bg-red-500/10 hover:text-red-500'
-            }`}
-            title="Delete"
-          >
-            <Trash2 size={14} />
-          </button>
-        </div>
-      ) : null}
-
-      {showDeleteConfirm ? (
-        <div className="flex flex-shrink-0 items-center gap-2">
-          <span className="text-xs font-medium text-red-500">Delete?</span>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              onDelete();
-              setShowDeleteConfirm(false);
-            }}
-            className="rounded-md bg-red-500/20 p-1 text-red-500 transition-colors hover:bg-red-500 hover:text-white"
-          >
-            <Check size={14} />
-          </button>
-          <button
-            onClick={(event) => {
-              event.stopPropagation();
-              setShowDeleteConfirm(false);
-            }}
-            className={`rounded-md p-1 transition-colors ${
-              theme === 'dark' ? 'bg-white/10 text-neutral-300 hover:bg-white/20' : 'bg-black/10 text-neutral-600 hover:bg-black/20'
-            }`}
-          >
-            <X size={14} />
-          </button>
-        </div>
+          className={`rounded-md p-1.5 transition-colors ${
+            clip.isPinned
+              ? 'bg-indigo-500/10 text-indigo-500'
+              : theme === 'dark'
+                ? 'text-neutral-400 hover:bg-white/10 hover:text-white'
+                : 'text-neutral-500 hover:bg-black/5 hover:text-black'
+          }`}
+          title={pinLabel}
+        >
+          <Pin size={14} className={clip.isPinned ? 'fill-current' : ''} />
+        </button>
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect();
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 2000);
+            onCopy();
+          }}
+          className={`rounded-md p-1.5 transition-colors ${
+            copied
+              ? 'bg-emerald-500/10 text-emerald-500'
+              : theme === 'dark'
+                ? 'text-neutral-400 hover:bg-white/10 hover:text-white'
+                : 'text-neutral-500 hover:bg-black/5 hover:text-black'
+          }`}
+          title={TRANSLATIONS[language].copy}
+        >
+          {copied ? <Check size={14} /> : <Copy size={14} />}
+        </button>
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect();
+            onPreview();
+          }}
+          className={`rounded-md p-1.5 transition-colors ${
+            theme === 'dark' ? 'text-neutral-400 hover:bg-white/10 hover:text-white' : 'text-neutral-500 hover:bg-black/5 hover:text-black'
+          }`}
+          title={previewLabel}
+        >
+          <Maximize2 size={14} />
+        </button>
+        <button
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect();
+            onDelete();
+          }}
+          className={`rounded-md p-1.5 transition-colors ${
+            theme === 'dark' ? 'text-neutral-400 hover:bg-red-500/20 hover:text-red-400' : 'text-neutral-500 hover:bg-red-500/10 hover:text-red-500'
+          }`}
+          title={TRANSLATIONS[language].delete}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
       ) : null}
     </div>
   );
@@ -1633,6 +2000,8 @@ const ClipItem = memo(function ClipItem({
     prev.isSelected === next.isSelected &&
     prev.theme === next.theme &&
     prev.language === next.language &&
+    prev.multiSelectMode === next.multiSelectMode &&
+    prev.isMultiSelected === next.isMultiSelected &&
     prev.previewLabel === next.previewLabel &&
     prev.pinLabel === next.pinLabel
   );
@@ -1650,6 +2019,7 @@ function SettingsModal({
   onTogglePlaySounds,
   onToggleShortcutHints,
   onRetentionChange,
+  onRecycleRetentionChange,
   onMaxClipsChange,
   onToggleIgnorePasswordManagers,
   onTogglePlainTextOnly,
@@ -1671,6 +2041,7 @@ function SettingsModal({
   onTogglePlaySounds: () => void;
   onToggleShortcutHints: () => void;
   onRetentionChange: (value: string) => void;
+  onRecycleRetentionChange: (value: string) => void;
   onMaxClipsChange: (value: string) => void;
   onToggleIgnorePasswordManagers: () => void;
   onTogglePlainTextOnly: () => void;
@@ -1727,7 +2098,7 @@ function SettingsModal({
       >
         <div className={`flex w-56 flex-col gap-1 border-r p-4 ${theme === 'dark' ? 'border-white/5' : 'border-black/5'}`}>
           <div className="px-2 pb-4 pt-2">
-            <h2 className={`text-sm font-semibold ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.settings}</h2>
+            <h2 className={`text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.settings}</h2>
           </div>
           <SettingsTab theme={theme} active={activeTab === 'general'} onClick={() => setActiveTab('general')} icon={<Settings size={16} />} label={t.general} />
           <SettingsTab theme={theme} active={activeTab === 'shortcuts'} onClick={() => setActiveTab('shortcuts')} icon={<Keyboard size={16} />} label={t.shortcuts} />
@@ -1750,7 +2121,7 @@ function SettingsModal({
               {activeTab === 'general' ? (
                 <motion.div key="general" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.15 }} className="space-y-8">
                   <div>
-                    <h3 className={`mb-4 text-lg font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.general}</h3>
+                    <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.general}</h3>
                     <div className="space-y-4">
                       <SelectRow
                         theme={theme}
@@ -1774,9 +2145,16 @@ function SettingsModal({
                   <div className={`h-px ${theme === 'dark' ? 'bg-white/5' : 'bg-black/5'}`} />
 
                   <div>
-                    <h3 className={`mb-4 text-sm font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.historyRetention}</h3>
+                    <h3 className={`mb-4 text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.historyRetention}</h3>
                     <div className="space-y-3">
                       <SelectRow theme={theme} label={t.keepHistoryFor} value={String(settings.history_retention_days)} options={retentionOptions} onChange={onRetentionChange} />
+                      <SelectRow
+                        theme={theme}
+                        label={t.recycleBinRetention}
+                        value={String(settings.recycle_bin_retention_days ?? 30)}
+                        options={retentionOptions}
+                        onChange={onRecycleRetentionChange}
+                      />
                       <SelectRow theme={theme} label={t.maxClips} value={String(settings.max_clips)} options={maxClipOptions} onChange={onMaxClipsChange} />
                     </div>
                   </div>
@@ -1786,7 +2164,7 @@ function SettingsModal({
               {activeTab === 'shortcuts' ? (
                 <motion.div key="shortcuts" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.15 }} className="space-y-8">
                   <div>
-                    <h3 className={`mb-4 text-lg font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.shortcuts}</h3>
+                    <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.shortcuts}</h3>
                     <div className="space-y-4">
                       <ShortcutSetting theme={theme} label={t.screenshotShortcut} value={settings.screenshot_shortcut ?? 'Alt+S'} onChange={(value) => onSaveShortcut('screenshot', value)} />
                       <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? 'Alt+X'} onChange={(value) => onSaveShortcut('toggle_window', value)} />
@@ -1802,7 +2180,7 @@ function SettingsModal({
               {activeTab === 'advanced' ? (
                 <motion.div key="advanced" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.15 }} className="space-y-8">
                   <div>
-                    <h3 className={`mb-4 text-lg font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.advanced}</h3>
+                    <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.advanced}</h3>
                     <div className="space-y-4">
                       <ToggleSetting theme={theme} label={t.ignorePasswordManagers} description={t.ignorePasswordManagersDesc} checked={settings.ignore_password_managers} onChange={onToggleIgnorePasswordManagers} />
                       <ToggleSetting theme={theme} label={t.plainTextOnly} description={t.plainTextOnlyDesc} checked={settings.plain_text_only} onChange={onTogglePlainTextOnly} />
@@ -1812,7 +2190,7 @@ function SettingsModal({
                   <div className={`h-px ${theme === 'dark' ? 'bg-white/5' : 'bg-black/5'}`} />
 
                   <div>
-                    <h3 className={`mb-4 text-sm font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.dataManagement}</h3>
+                    <h3 className={`mb-4 text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.dataManagement}</h3>
                     <div className="space-y-4">
                       <ActionRow theme={theme} title={t.exportHistory} description={t.exportDesc} actionLabel={t.exportHistory} onClick={onExport} />
                       <ActionRow theme={theme} title={t.restoreDefaults} description={t.restoreDefaultsDesc} actionLabel={t.restoreDefaults} onClick={onRestoreDefaults} />
@@ -1823,12 +2201,12 @@ function SettingsModal({
                   <div className={`h-px ${theme === 'dark' ? 'bg-white/5' : 'bg-black/5'}`} />
 
                   <div>
-                    <h3 className="mb-4 text-sm font-medium text-red-500">{t.dangerZone}</h3>
+                    <h3 className="mb-4 text-sm font-light text-red-500">{t.dangerZone}</h3>
                     {!showConfirmClear ? (
                       <div>
                         <button
                           onClick={() => setShowConfirmClear(true)}
-                          className={`rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
+                          className={`rounded-lg border px-4 py-2 text-sm font-light transition-colors ${
                             theme === 'dark' ? 'border-red-500/20 bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'border-red-200 bg-red-50 text-red-600 hover:bg-red-100'
                           }`}
                         >
@@ -1841,7 +2219,7 @@ function SettingsModal({
                         <div className="flex items-start gap-3">
                           <AlertTriangle className={theme === 'dark' ? 'mt-0.5 text-red-400' : 'mt-0.5 text-red-500'} size={18} />
                           <div>
-                            <h4 className={`text-sm font-medium ${theme === 'dark' ? 'text-red-400' : 'text-red-600'}`}>{t.confirmClear}</h4>
+                            <h4 className={`text-sm font-light ${theme === 'dark' ? 'text-red-400' : 'text-red-600'}`}>{t.confirmClear}</h4>
                             <p className={`mb-4 mt-1 text-xs ${theme === 'dark' ? 'text-red-400/70' : 'text-red-600/70'}`}>{t.clearWarning}</p>
                             <div className="flex items-center gap-2">
                               <button
@@ -1849,13 +2227,13 @@ function SettingsModal({
                                   onClearAll();
                                   setShowConfirmClear(false);
                                 }}
-                                className="rounded-md bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-600"
+                                className="rounded-md bg-red-500 px-3 py-1.5 text-xs font-light text-white transition-colors hover:bg-red-600"
                               >
                                 {t.confirm}
                               </button>
                               <button
                                 onClick={() => setShowConfirmClear(false)}
-                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                                className={`rounded-md px-3 py-1.5 text-xs font-light transition-colors ${
                                   theme === 'dark' ? 'bg-white/5 text-neutral-300 hover:bg-white/10' : 'bg-black/5 text-neutral-700 hover:bg-black/10'
                                 }`}
                               >
@@ -1938,7 +2316,7 @@ function ToggleSetting({
   return (
     <div className="group flex items-center justify-between">
       <div className="pr-4">
-        <div className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+        <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
         <div className="mt-0.5 text-xs text-neutral-500">{description}</div>
       </div>
       <button
@@ -1972,7 +2350,7 @@ function SelectRow({
 
   return (
     <div className="relative flex items-center justify-between">
-      <div className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+      <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
       <button
         type="button"
         onClick={() => setOpen((prev) => !prev)}
@@ -2052,10 +2430,10 @@ function SliderSetting({
     <div className="space-y-2">
       <div className="flex items-end justify-between gap-3">
         <div className="min-w-0">
-          <div className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+          <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
           <div className="mt-0.5 text-xs text-neutral-500">{description}</div>
         </div>
-        <span className="flex-shrink-0 text-[11px] font-medium text-neutral-500">{formatValue(value)}</span>
+        <span className="flex-shrink-0 text-[11px] font-light text-neutral-500">{formatValue(value)}</span>
       </div>
       <input
         type="range"
@@ -2068,8 +2446,8 @@ function SliderSetting({
         style={{
           background:
             theme === 'dark'
-              ? `linear-gradient(to right, rgb(99 102 241) 0%, rgb(99 102 241) ${progress}, rgba(255,255,255,0.08) ${progress}, rgba(255,255,255,0.08) 100%)`
-              : `linear-gradient(to right, rgb(99 102 241) 0%, rgb(99 102 241) ${progress}, rgba(0,0,0,0.08) ${progress}, rgba(0,0,0,0.08) 100%)`,
+              ? `linear-gradient(to right, rgb(20 184 166) 0%, rgb(20 184 166) ${progress}, rgba(255,255,255,0.08) ${progress}, rgba(255,255,255,0.08) 100%)`
+              : `linear-gradient(to right, rgb(20 184 166) 0%, rgb(20 184 166) ${progress}, rgba(0,0,0,0.08) ${progress}, rgba(0,0,0,0.08) 100%)`,
         }}
       />
     </div>
@@ -2092,12 +2470,12 @@ function ActionRow({
   return (
     <div className="flex items-center justify-between">
       <div>
-        <div className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{title}</div>
+        <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{title}</div>
         <div className="mt-0.5 text-xs text-neutral-500">{description}</div>
       </div>
       <button
         onClick={onClick}
-        className={`inline-flex h-8 shrink-0 items-center whitespace-nowrap rounded-lg px-3 text-xs font-medium transition-colors ${
+        className={`inline-flex h-8 shrink-0 items-center whitespace-nowrap rounded-lg px-3 text-xs font-light transition-colors ${
           theme === 'dark' ? 'bg-white/5 text-neutral-200 hover:bg-white/10' : 'bg-black/5 text-neutral-800 hover:bg-black/10'
         }`}
       >
@@ -2155,7 +2533,7 @@ function ShortcutSetting({
 
   return (
     <div className="flex items-center justify-between">
-      <div className={`text-sm font-medium ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+      <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
       <button
         ref={triggerRef}
         type="button"

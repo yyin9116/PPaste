@@ -10,6 +10,8 @@ export interface BackendClip {
   preview?: string;
   timestamp: number;
   source?: string;
+  file_ext?: string;
+  deleted_at?: number;
 }
 
 export interface BackendClipEvent {
@@ -27,6 +29,7 @@ export interface BackendSettings {
   play_sounds: boolean;
   show_shortcut_hints: boolean;
   history_retention_days: number;
+  recycle_bin_retention_days: number;
   max_clips: number;
   ignore_password_managers: boolean;
   plain_text_only: boolean;
@@ -51,6 +54,22 @@ export async function getClips(limit = 100, offset = 0): Promise<BackendClip[]> 
 
 export async function deleteClip(id: string): Promise<void> {
   return invoke('delete_clip', { id });
+}
+
+export async function getDeletedClips(limit = 100, offset = 0): Promise<BackendClip[]> {
+  return invoke<BackendClip[]>('get_deleted_clips', { limit, offset });
+}
+
+export async function restoreDeletedClip(id: string): Promise<void> {
+  return invoke('restore_deleted_clip', { id });
+}
+
+export async function permanentlyDeleteClip(id: string): Promise<void> {
+  return invoke('permanently_delete_clip', { id });
+}
+
+export async function clearDeletedClips(): Promise<void> {
+  return invoke('clear_deleted_clips');
 }
 
 export async function clearAllClips(): Promise<void> {
