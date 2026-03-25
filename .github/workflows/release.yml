@@ -102,7 +102,7 @@ jobs:
 
       - name: Read tag message (macOS)
         if: matrix.os == 'macos-14'
-        id: tag-message
+        id: tag-message-macos
         shell: bash
         run: |
           BODY="$(git show -s --format=%B ${{ github.ref_name }})"
@@ -114,7 +114,7 @@ jobs:
 
       - name: Read tag message (Windows)
         if: matrix.os == 'windows-latest'
-        id: tag-message
+        id: tag-message-windows
         shell: pwsh
         run: |
           $body = git show -s --format=%B $env:GITHUB_REF_NAME
@@ -122,8 +122,16 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value $body
           Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
 
-      - name: Create GitHub release
+      - name: Create GitHub release (macOS)
+        if: matrix.os == 'macos-14'
         uses: softprops/action-gh-release@v2
         with:
-          body: ${{ steps.tag-message.outputs.body }}
+          body: ${{ steps.tag-message-macos.outputs.body }}
+          files: ${{ steps.release-files.outputs.files }}
+
+      - name: Create GitHub release (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.tag-message-windows.outputs.body }}
           files: ${{ steps.release-files.outputs.files }}
