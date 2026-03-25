@@ -108,7 +108,7 @@ jobs:
           TAG="${{ github.ref_name }}"
           # 提取“带注释的 tag 注释内容”（不是 commit message）
           # git cat-file -p 输出为 tag 对象，消息从第一段空行后开始
-          BODY="$(git cat-file -p "$TAG" | awk 'BEGIN{found=0} { if(found){print} else if($0==""){found=1} }')"
+          BODY="$(git cat-file -p "$TAG" | sed -e '1,/^$/d')"
           {
             echo "body<<EOF"
             echo "$BODY"
