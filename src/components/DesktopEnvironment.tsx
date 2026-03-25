@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Camera,
   Check,
+  CheckSquare,
   ChevronDown,
   Clock,
   Code,
@@ -14,8 +15,8 @@ import {
   Link as LinkIcon,
   Maximize2,
   Monitor,
-  CheckSquare,
   Pin,
+  RotateCcw,
   Search,
   Settings,
   Square,
@@ -864,7 +865,7 @@ export default function DesktopEnvironment() {
 
   return (
     <div
-      className={`relative h-screen w-full overflow-hidden font-sans selection:bg-neutral-800 ${
+      className={`relative h-screen w-full overflow-hidden  selection:bg-neutral-800 ${
         theme === 'dark' ? 'bg-transparent text-neutral-200' : 'bg-transparent text-neutral-800'
       }`}
     >
@@ -887,7 +888,8 @@ export default function DesktopEnvironment() {
             onPasteClip={(clip) => void handleClipAction(clip, 'paste')}
             onCopyClip={(clip) => void handleClipAction(clip, 'copy')}
             onDeleteClip={(id) => void handleDeleteClip(id)}
-                      onRestoreDeletedClip={(id) => void handleRestoreDeletedClip(id)}
+            onDeleteClips={(ids) => void handleDeleteClips(ids)}
+            onRestoreDeletedClip={(id) => void handleRestoreDeletedClip(id)}
             onClearRecycleBin={() => void handleClearRecycleBin()}
             onTogglePinned={handleTogglePinned}
           />
@@ -978,6 +980,7 @@ function ClipboardPalette({
   onPasteClip,
   onCopyClip,
   onDeleteClip,
+  onDeleteClips,
   onRestoreDeletedClip,
   onClearRecycleBin,
   onTogglePinned,
@@ -998,6 +1001,7 @@ function ClipboardPalette({
   onPasteClip: (clip: ClipView) => void;
   onCopyClip: (clip: ClipView) => void;
   onDeleteClip: (id: string) => void;
+  onDeleteClips: (ids: string[]) => Promise<void> | void;
   onRestoreDeletedClip: (id: string) => void;
   onClearRecycleBin: () => void;
   onTogglePinned: (id: string) => void;
@@ -1222,6 +1226,12 @@ function ClipboardPalette({
             onPasteClip(selected);
           }
         }
+      } else if (event.key === 'Delete' && isMultiSelectMode && activeCategory !== 'recycle') {
+        event.preventDefault();
+        if (selectedClipIds.length > 0) {
+          void onDeleteClips(selectedClipIds);
+          setSelectedClipIds([]);
+        }
       } else if (event.code === 'Space' && (document.activeElement?.tagName !== 'INPUT' || query.trim().length === 0)) {
         event.preventDefault();
         if (isMultiSelectMode) {
@@ -1264,6 +1274,7 @@ function ClipboardPalette({
     isMultiSelectMode,
     onClose,
     onCopyClip,
+    onDeleteClips,
     onOpenSettings,
     onPasteClip,
     onRestoreDeletedClip,
@@ -1377,15 +1388,11 @@ function ClipboardPalette({
                   }
                 }}
                 className={`ml-auto rounded-md p-1.5 transition-colors ${
-                  isMultiSelectMode
-                    ? 'bg-indigo-500/15 text-indigo-500'
-                    : theme === 'dark'
-                      ? 'text-neutral-500 hover:bg-white/10 hover:text-white'
-                      : 'text-neutral-400 hover:bg-black/5 hover:text-black'
-                }`}
+                  theme === 'dark' ? 'text-neutral-500 hover:bg-white/10 hover:text-white' : 'text-neutral-400 hover:bg-black/5 hover:text-black'
+                } ${isMultiSelectMode ? 'text-indigo-500' : ''}`}
                 title={isMultiSelectMode ? t.finishMultiSelect : t.startMultiSelect}
               >
-                <CheckSquare size={16} />
+                <CheckSquare size={14} />
               </button>
             ) : null}
           </div>
@@ -1453,18 +1460,6 @@ function ClipboardPalette({
               </div>
             ) : (
               <div className="space-y-2">
-                <div className={`mb-2 flex items-center justify-between rounded-xl border px-3 py-2 text-xs font-light ${
-                  theme === 'dark' ? 'border-gray-800 bg-gray-900 text-gray-300' : 'border-gray-200 bg-gray-50 text-gray-700'
-                }`}>
-                  <span>{t.recycleBin}</span>
-                  <button
-                    type="button"
-                    onClick={onClearRecycleBin}
-                    className="rounded-lg bg-red-500 px-2 py-1 text-white transition-colors hover:bg-red-600"
-                  >
-                    {t.clearRecycleBin}
-                  </button>
-                </div>
                 {filteredClips.map((clip, index) => (
                   <div
                     key={clip.id}
@@ -1481,7 +1476,7 @@ function ClipboardPalette({
                     <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
                       theme === 'dark' ? 'bg-white/10 text-neutral-400' : 'bg-black/5 text-neutral-500'
                     }`}>
-                      <Trash2 size={14} />
+                      <Trash2 size={13} className="opacity-80" />
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-light">{clip.content.split('\n')[0]}</div>
@@ -1494,9 +1489,12 @@ function ClipboardPalette({
                     <button
                       type="button"
                       onClick={() => onRestoreDeletedClip(clip.id)}
-                      className="rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-light text-white transition-colors hover:bg-indigo-600"
+                      className={`rounded-md p-1.5 transition-colors ${
+                        theme === 'dark' ? 'text-neutral-400 hover:bg-white/10 hover:text-white' : 'text-neutral-500 hover:bg-black/5 hover:text-black'
+                      }`}
+                      title={t.restore}
                     >
-                      {t.restore}
+                      <RotateCcw size={13} className="opacity-80" />
                     </button>
                   </div>
                 ))}
@@ -1553,11 +1551,63 @@ function ClipboardPalette({
                 <div className="flex min-w-0 items-center gap-3">
                   <span className="truncate">{t.selectedCount.replace('{count}', String(selectedClipIds.length))}</span>
                   <ShortcutHint theme={theme} keys={['Enter']} label={t.selectClip} />
-                  <ShortcutHint theme={theme} keys={['Del']} label={t.deleteSelected} />
+                  <button
+                    type="button"
+                    onClick={() => void onDeleteClips(selectedClipIds)}
+                    disabled={selectedClipIds.length === 0}
+                    className={`inline-flex h-6 items-center rounded px-2 ${
+                      selectedClipIds.length === 0
+                        ? 'cursor-not-allowed opacity-60'
+                        : theme === 'dark'
+                          ? 'hover:bg-white/10 hover:text-white'
+                          : 'hover:bg-black/10 hover:text-black'
+                    }`}
+                    title={t.deleteSelected}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+                <div className="ml-4 flex min-w-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={clearClipSelection}
+                    className={`inline-flex h-6 items-center rounded px-2 ${
+                      theme === 'dark' ? 'hover:bg-white/10 hover:text-white' : 'hover:bg-black/10 hover:text-black'
+                    }`}
+                    title={t.clearSelection}
+                  >
+                    <X size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={finishMultiSelect}
+                    className={`inline-flex h-6 items-center rounded px-2 ${
+                      theme === 'dark' ? 'hover:bg-white/10 hover:text-white' : 'hover:bg-black/10 hover:text-black'
+                    }`}
+                    title={t.finishMultiSelect}
+                  >
+                    <Check size={12} />
+                  </button>
+                </div>
+              </>
+            ) : activeCategory === 'recycle' ? (
+              <>
+                <div className="flex min-w-0 items-center gap-3">
+                  <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
+                  <ShortcutHint theme={theme} keys={['Enter']} label={t.restore} />
+                  <button
+                    type="button"
+                    onClick={onClearRecycleBin}
+                    className={`inline-flex h-6 items-center rounded px-2 ${
+                      theme === 'dark' ? 'hover:bg-white/10 hover:text-white' : 'hover:bg-black/10 hover:text-black'
+                    }`}
+                    title={t.clearRecycleBin}
+                  >
+                    <Trash2 size={12} />
+                  </button>
                 </div>
                 <div className="ml-4 flex min-w-0 items-center gap-3">
-                  <ShortcutHint theme={theme} keys={['Esc']} label={t.finishMultiSelect} />
-                  <ShortcutHint theme={theme} keys={['X']} label={t.clearSelection} />
+                  <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
                 </div>
               </>
             ) : (
@@ -1567,9 +1617,9 @@ function ClipboardPalette({
                   <ShortcutHint
                     theme={theme}
                     keys={['Enter']}
-                    label={activeCategory === 'recycle' ? t.restore : t.paste}
+                    label={t.paste}
                   />
-                  {activeCategory === 'recycle' ? null : <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />}
+                  <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />
                 </div>
                 <div className="ml-4 flex min-w-0 items-center gap-3">
                   <ShortcutHint theme={theme} keys={isMac ? ['Option', 'S'] : ['Alt', 'S']} label={t.screenshotShortcut} />
@@ -1823,6 +1873,7 @@ const ClipItem = memo(function ClipItem({
       data-clip-id={clip.id}
       onMouseDown={(event) => {
         if (!multiSelectMode || event.button !== 0) return;
+        if ((event.target as HTMLElement).closest('button')) return;
         event.preventDefault();
         onSelectionDragStart();
       }}
@@ -1835,7 +1886,7 @@ const ClipItem = memo(function ClipItem({
         if (multiSelectMode) return;
         onPaste();
       }}
-      className={`group relative flex h-16 cursor-pointer items-center gap-3 rounded-xl px-3 py-2 transition-colors ${
+      className={`group relative flex h-16 cursor-pointer items-center gap-3 rounded-xl px-3 py-2 font-sans transition-colors ${
         isSelected
           ? theme === 'dark'
             ? 'bg-indigo-500/15 text-white'
@@ -1848,6 +1899,10 @@ const ClipItem = memo(function ClipItem({
       {multiSelectMode ? (
         <button
           type="button"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
           onClick={(event) => {
             event.preventDefault();
             event.stopPropagation();

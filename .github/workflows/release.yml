@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -98,9 +100,30 @@ jobs:
             } >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Read tag message (macOS)
+        if: matrix.os == 'macos-14'
+        id: tag-message
+        shell: bash
+        run: |
+          BODY="$(git show -s --format=%B ${{ github.ref_name }})"
+          {
+            echo "body<<EOF"
+            echo "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read tag message (Windows)
+        if: matrix.os == 'windows-latest'
+        id: tag-message
+        shell: pwsh
+        run: |
+          $body = git show -s --format=%B $env:GITHUB_REF_NAME
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "body<<EOF"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $body
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          body: |
-            Release ${{ github.ref_name }}
+          body: ${{ steps.tag-message.outputs.body }}
           files: ${{ steps.release-files.outputs.files }}
