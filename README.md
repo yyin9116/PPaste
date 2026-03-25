@@ -1,4 +1,6 @@
-# 📦 PPaste
+# <img src=".github/assets/ppaste-logo.svg" width="24" height="24" alt="PPaste logo" /> PPaste
+
+![PPaste 预览](.github/assets/main-preview.png)
 
 **Your Clipboard, Infinite Memory. (你的剪贴板，无限记忆。)**
 

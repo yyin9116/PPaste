@@ -105,7 +105,10 @@ jobs:
         id: tag-message-macos
         shell: bash
         run: |
-          BODY="$(git show -s --format=%B ${{ github.ref_name }})"
+          TAG="${{ github.ref_name }}"
+          # 提取“带注释的 tag 注释内容”（不是 commit message）
+          # git cat-file -p 输出为 tag 对象，消息从第一段空行后开始
+          BODY="$(git cat-file -p "$TAG" | awk 'BEGIN{found=0} { if(found){print} else if($0==""){found=1} }')"
           {
             echo "body<<EOF"
             echo "$BODY"
@@ -117,7 +120,24 @@ jobs:
         id: tag-message-windows
         shell: pwsh
         run: |
-          $body = git show -s --format=%B $env:GITHUB_REF_NAME
+          $tag = $env:GITHUB_REF_NAME
+          $raw = git cat-file -p $tag
+          $lines = $raw -split "\r?\n"
+
+          # 找到 tag 对象里“第一段空行”后的消息
+          $idx = 0
+          while ($idx -lt $lines.Length -and $lines[$idx] -ne "") { $idx++ }
+
+          if ($idx -ge $lines.Length) {
+            $body = ""
+          } else {
+            $bodyLines = @()
+            for ($i = $idx + 1; $i -lt $lines.Length; $i++) {
+              $bodyLines += $lines[$i]
+            }
+            $body = ($bodyLines -join "`n").TrimEnd()
+          }
+
           Add-Content -Path $env:GITHUB_OUTPUT -Value "body<<EOF"
           Add-Content -Path $env:GITHUB_OUTPUT -Value $body
           Add-Content -Path $env:GITHUB_OUTPUT -Value "EOF"
