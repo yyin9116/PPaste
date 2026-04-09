@@ -383,6 +383,8 @@ const TRANSLATIONS = {
     light: 'Light',
     recentSearches: 'Recent Searches',
     clearSearches: 'Clear',
+    sourceFilter: 'Source',
+    allSources: 'All Apps',
     emptyStateMsg: 'Try a different keyword or category',
     preview: 'Quick Look',
     pin: 'Pin',
@@ -481,6 +483,8 @@ const TRANSLATIONS = {
     light: '浅色',
     recentSearches: '最近搜索',
     clearSearches: '清除',
+    sourceFilter: '来源应用',
+    allSources: '全部应用',
     emptyStateMsg: '尝试使用不同的关键字或分类',
     preview: '快速预览',
     pin: '置顶',
@@ -1012,6 +1016,7 @@ function ClipboardPalette({
   const deferredQuery = useDeferredValue(query);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [activeCategory, setActiveCategory] = useState<ActiveCategory>('all');
+  const [activeSource, setActiveSource] = useState<string>('all');
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [quickLookItem, setQuickLookItem] = useState<ClipView | null>(null);
   const [keyboardNavigation, setKeyboardNavigation] = useState(false);
@@ -1022,15 +1027,23 @@ function ClipboardPalette({
   const isDragSelectingRef = useRef(false);
   const dragSelectTargetRef = useRef(false);
 
+  const availableSources = useMemo(() => {
+    const sourceClips = activeCategory === 'recycle' ? deletedClips : clips;
+    return Array.from(new Set(sourceClips.map((clip) => clip.source).filter((value): value is string => Boolean(value)))).sort((a, b) =>
+      a.localeCompare(b, language === 'zh' ? 'zh-Hans' : 'en', { sensitivity: 'base' }),
+    );
+  }, [activeCategory, clips, deletedClips, language]);
+
   const filteredClips = useMemo(() => {
     const source = activeCategory === 'recycle' ? deletedClips : clips;
     return source.filter((clip) => {
       const matchesQuery =
         clip.content.toLowerCase().includes(deferredQuery.toLowerCase()) || clip.source?.toLowerCase().includes(deferredQuery.toLowerCase());
       const matchesCategory = activeCategory === 'all' || activeCategory === 'recycle' ? true : getCategoryBucket(clip) === activeCategory;
-      return matchesQuery && matchesCategory;
+      const matchesSource = activeSource === 'all' ? true : clip.source === activeSource;
+      return matchesQuery && matchesCategory && matchesSource;
     });
-  }, [activeCategory, clips, deferredQuery, deletedClips]);
+  }, [activeCategory, activeSource, clips, deferredQuery, deletedClips]);
 
   const saveQuery = useCallback(
     (value: string) => {
@@ -1124,7 +1137,7 @@ function ClipboardPalette({
     setSelectedIndex(0);
     hoveredClipIdRef.current = null;
     setKeyboardNavigation(false);
-  }, [activeCategory, query, showSuggestions]);
+  }, [activeCategory, activeSource, query, showSuggestions]);
 
   useEffect(() => {
     if (activeCategory === 'recycle') {
@@ -1132,6 +1145,13 @@ function ClipboardPalette({
     }
     setSelectedClipIds([]);
   }, [activeCategory]);
+
+  useEffect(() => {
+    if (activeSource === 'all') return;
+    if (!availableSources.includes(activeSource)) {
+      setActiveSource('all');
+    }
+  }, [activeSource, availableSources]);
 
   useEffect(() => {
     const stopDragSelect = () => {
@@ -1396,6 +1416,45 @@ function ClipboardPalette({
               </button>
             ) : null}
           </div>
+
+          {availableSources.length > 0 ? (
+            <div className="custom-scrollbar flex items-center gap-2 overflow-x-auto px-4 pb-3">
+              <span className={`pr-1 text-[11px] font-light ${
+                theme === 'dark' ? 'text-neutral-500' : 'text-neutral-500'
+              }`}>
+                {t.sourceFilter}
+              </span>
+              <button
+                type="button"
+                onClick={() => setActiveSource('all')}
+                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${
+                  activeSource === 'all'
+                    ? 'bg-emerald-500 text-white'
+                    : theme === 'dark'
+                      ? 'bg-white/5 text-neutral-400 hover:bg-white/10 hover:text-neutral-200'
+                      : 'bg-black/5 text-neutral-600 hover:bg-black/10 hover:text-neutral-800'
+                }`}
+              >
+                {t.allSources}
+              </button>
+              {availableSources.map((source) => (
+                <button
+                  key={source}
+                  type="button"
+                  onClick={() => setActiveSource(source)}
+                  className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${
+                    activeSource === source
+                      ? 'bg-emerald-500 text-white'
+                      : theme === 'dark'
+                        ? 'bg-white/5 text-neutral-400 hover:bg-white/10 hover:text-neutral-200'
+                        : 'bg-black/5 text-neutral-600 hover:bg-black/10 hover:text-neutral-800'
+                  }`}
+                >
+                  {source}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
 
         <div

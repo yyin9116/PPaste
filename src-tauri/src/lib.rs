@@ -556,6 +556,50 @@ fn clip_signature(content: &str, clip_type: &str) -> u64 {
     hasher.finish()
 }
 
+fn remove_duplicate_rows_for_clip(
+    conn: &Connection,
+    keep_id: &str,
+    clip_type: &str,
+    content: &str,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM clips
+         WHERE id != ?1 AND clip_type = ?2 AND content = ?3",
+        params![keep_id, clip_type, content],
+    )
+}
+
+fn dedupe_existing_clips(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let mut duplicates = conn.prepare(
+        "SELECT clip_type, content
+         FROM clips
+         GROUP BY clip_type, content
+         HAVING COUNT(*) > 1",
+    )?;
+
+    let duplicate_groups = duplicates.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut removed = 0usize;
+    for group in duplicate_groups {
+        let (clip_type, content) = group?;
+        let keep_id = conn.query_row(
+            "SELECT id
+             FROM clips
+             WHERE clip_type = ?1 AND content = ?2
+             ORDER BY timestamp DESC, rowid DESC
+             LIMIT 1",
+            params![&clip_type, &content],
+            |row| row.get::<_, String>(0),
+        )?;
+
+        removed += remove_duplicate_rows_for_clip(conn, &keep_id, &clip_type, &content)?;
+    }
+
+    Ok(removed)
+}
+
 fn save_clip_with_path(
     state: &AppState,
     app: Option<&tauri::AppHandle>,
@@ -618,6 +662,10 @@ fn save_clip_with_path(
             ) {
                 eprintln!("Failed to promote existing clip: {}", e);
                 return;
+            }
+
+            if let Err(e) = remove_duplicate_rows_for_clip(&conn, &clip.id, &clip.clip_type, &clip.content) {
+                eprintln!("Failed to remove duplicate rows for promoted clip: {}", e);
             }
 
             let duplicate_hits = {
@@ -1269,7 +1317,20 @@ fn restore_deleted_clip(state: tauri::State<Arc<AppState>>, id: String) -> Resul
         return Err("Deleted clip not found".to_string());
     };
 
-    let exists: bool = conn
+    let existing_clip_id: Option<String> = conn
+        .query_row(
+            "SELECT id
+             FROM clips
+             WHERE clip_type = ?1 AND content = ?2
+             ORDER BY timestamp DESC, rowid DESC
+             LIMIT 1",
+            params![&clip_type, &content],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let same_id_exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
             params![id],
@@ -1277,25 +1338,41 @@ fn restore_deleted_clip(state: tauri::State<Arc<AppState>>, id: String) -> Resul
         )
         .unwrap_or(false);
 
-    let restore_id = if exists { Uuid::new_v4().to_string() } else { id.clone() };
+    let restore_id = if existing_clip_id.is_none() && same_id_exists {
+        Uuid::new_v4().to_string()
+    } else {
+        existing_clip_id.clone().unwrap_or(id.clone())
+    };
     let restored_timestamp = Utc::now().timestamp_millis();
 
-    conn.execute(
-        "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            restore_id,
-            clip_type,
-            category,
-            content,
-            preview,
-            restored_timestamp,
-            source,
-            file_path,
-            file_ext
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+    if existing_clip_id.is_some() {
+        conn.execute(
+            "UPDATE clips
+             SET category = ?1, preview = COALESCE(?2, preview), timestamp = ?3, source = ?4, file_path = COALESCE(?5, file_path), file_ext = COALESCE(?6, file_ext)
+             WHERE id = ?7",
+            params![category, preview, restored_timestamp, source, file_path, file_ext, restore_id],
+        )
+        .map_err(|e| e.to_string())?;
+
+        remove_duplicate_rows_for_clip(&conn, &restore_id, &clip_type, &content).map_err(|e| e.to_string())?;
+    } else {
+        conn.execute(
+            "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                restore_id,
+                clip_type,
+                category,
+                content,
+                preview,
+                restored_timestamp,
+                source,
+                file_path,
+                file_ext
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     conn.execute("DELETE FROM deleted_clips WHERE id = ?1", params![id])
         .map_err(|e| e.to_string())?;
@@ -1979,6 +2056,10 @@ fn import_clips(state: tauri::State<Arc<AppState>>, file_path: String, merge: bo
             count += 1;
         }
     }
+
+    dedupe_existing_clips(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
+    cleanup_history(state.inner().as_ref());
     
     Ok(count)
 }
@@ -2061,6 +2142,10 @@ fn import_clips_json(state: tauri::State<Arc<AppState>>, payload: String, merge:
         }
     }
 
+    dedupe_existing_clips(&conn).map_err(|e| e.to_string())?;
+    drop(conn);
+    cleanup_history(state.inner().as_ref());
+
     Ok(count)
 }
 
@@ -2109,6 +2194,7 @@ pub fn run() {
     
     // 初始化数据库
     let conn = init_db(db_path.to_str().unwrap()).expect("Failed to initialize database");
+    dedupe_existing_clips(&conn).expect("Failed to dedupe existing clips");
     
     let default_settings = load_settings(&conn);
     let app_state = Arc::new(AppState {
