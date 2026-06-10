@@ -43,7 +43,33 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build release bundle
+      - name: Warn about unsigned macOS distribution
+        if: matrix.os == 'macos-14'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [[ -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            echo "::warning::macOS release will use ad-hoc signing. Add Developer ID signing and notarization secrets for public distribution without Gatekeeper warnings."
+          fi
+
+      - name: Build release bundle (macOS)
+        if: matrix.os == 'macos-14'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            export APPLE_SIGNING_IDENTITY="-"
+          fi
+          pnpm bundle
+
+      - name: Build release bundle (Windows)
+        if: matrix.os == 'windows-latest'
         run: pnpm bundle
 
       - name: Zip macOS app bundle
