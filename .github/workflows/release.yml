@@ -55,16 +55,28 @@ jobs:
       - name: Build release bundle (macOS)
         if: matrix.os == 'macos-14'
         env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE_SECRET: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD_SECRET: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_SECRET: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD_SECRET: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
-          if [[ -z "$APPLE_SIGNING_IDENTITY" ]]; then
+          if [[ -n "$APPLE_SIGNING_IDENTITY_SECRET" ]]; then
+            export APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY_SECRET"
+          else
             export APPLE_SIGNING_IDENTITY="-"
+          fi
+          if [[ -n "$APPLE_CERTIFICATE_SECRET" ]]; then
+            export APPLE_CERTIFICATE="$APPLE_CERTIFICATE_SECRET"
+            export APPLE_CERTIFICATE_PASSWORD="$APPLE_CERTIFICATE_PASSWORD_SECRET"
+            export KEYCHAIN_PASSWORD="$KEYCHAIN_PASSWORD_SECRET"
+          fi
+          if [[ -n "$APPLE_ID_SECRET" ]]; then
+            export APPLE_ID="$APPLE_ID_SECRET"
+            export APPLE_PASSWORD="$APPLE_PASSWORD_SECRET"
+            export APPLE_TEAM_ID="$APPLE_TEAM_ID_SECRET"
           fi
           pnpm bundle
 
