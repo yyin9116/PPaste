@@ -1,9 +1,9 @@
 use arboard::{Clipboard, ImageData};
-use chrono::Utc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use chrono::Utc;
 use image::ImageFormat;
-use rusqlite::{Connection, params};
 use rusqlite::OptionalExtension;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
@@ -14,13 +14,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tauri::Emitter;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle,
-    Manager,
+    AppHandle, Manager,
 };
-use tauri::Emitter;
 use uuid::Uuid;
 
 // --- 数据结构 ---
@@ -72,8 +71,8 @@ pub struct Settings {
     pub max_clips: i32,
     pub ignore_password_managers: bool,
     pub plain_text_only: bool,
-    pub storage_path: String,          // 自定义存储路径
-    pub screenshot_shortcut: String,   // 截图快捷键
+    pub storage_path: String,           // 自定义存储路径
+    pub screenshot_shortcut: String,    // 截图快捷键
     pub toggle_window_shortcut: String, // 开关窗口快捷键
     pub quick_paste_shortcut: String,   // 快速粘贴最新记录
     pub clear_history_shortcut: String, // 清空历史快捷键
@@ -88,7 +87,18 @@ impl Default for Settings {
             .join("storage")
             .to_string_lossy()
             .to_string();
-        
+
+        let screenshot_shortcut = if cfg!(target_os = "macos") {
+            "Option+S"
+        } else {
+            "Alt+S"
+        };
+        let toggle_window_shortcut = if cfg!(target_os = "macos") {
+            "Option+X"
+        } else {
+            "Alt+X"
+        };
+
         Settings {
             theme: "system".to_string(),
             language: "zh".to_string(),
@@ -102,13 +112,15 @@ impl Default for Settings {
             ignore_password_managers: true,
             plain_text_only: false,
             storage_path: default_storage,
-            screenshot_shortcut: "Alt+S".to_string(),      // Windows/Linux: Alt+S, macOS: Option+S
-            toggle_window_shortcut: "Alt+X".to_string(), // Windows/Linux: Alt+Space, macOS: Option+Space
+            screenshot_shortcut: screenshot_shortcut.to_string(),
+            toggle_window_shortcut: toggle_window_shortcut.to_string(),
             quick_paste_shortcut: "CmdOrCtrl+Shift+V".to_string(),
             clear_history_shortcut: "CmdOrCtrl+Shift+Backspace".to_string(),
         }
     }
 }
+
+const SCREENSHOT_SOURCE: &str = "Screenshot";
 
 // --- 应用状态 ---
 
@@ -168,7 +180,7 @@ fn migrate_legacy_app_data() -> Result<(), String> {
 
 fn init_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(db_path)?;
-    
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS clips (
             id TEXT PRIMARY KEY,
@@ -183,7 +195,7 @@ fn init_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
         )",
         [],
     )?;
-    
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -209,7 +221,7 @@ fn init_db(db_path: &str) -> Result<Connection, rusqlite::Error> {
     )?;
 
     migrate_db(&conn)?;
-    
+
     Ok(conn)
 }
 
@@ -271,7 +283,9 @@ fn load_settings(conn: &Connection) -> Settings {
     );
 
     match stored {
-        Ok(value) => serde_json::from_str::<Settings>(&value).unwrap_or_else(|_| Settings::default()),
+        Ok(value) => {
+            serde_json::from_str::<Settings>(&value).unwrap_or_else(|_| Settings::default())
+        }
         Err(_) => {
             let defaults = Settings::default();
             let _ = persist_settings(conn, &defaults);
@@ -311,7 +325,8 @@ fn image_format_extension(format: ImageFormat) -> &'static str {
 }
 
 fn compose_image_filename(source: &str, timestamp_millis: i64, sequence: u32, ext: &str) -> String {
-    let dt = chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_millis).unwrap_or_else(Utc::now);
+    let dt =
+        chrono::DateTime::<Utc>::from_timestamp_millis(timestamp_millis).unwrap_or_else(Utc::now);
     let ts = dt.format("%Y%m%d-%H%M%S").to_string();
     let normalized_source = source
         .chars()
@@ -343,7 +358,11 @@ fn generate_image_file_path(storage_path: &str, source: &str, ext: &str) -> Resu
     Err("Failed to generate unique image filename".to_string())
 }
 
-fn save_image_to_storage(storage_path: &str, image_data: &[u8], source: &str) -> Result<(String, String), String> {
+fn save_image_to_storage(
+    storage_path: &str,
+    image_data: &[u8],
+    source: &str,
+) -> Result<(String, String), String> {
     let format = detect_image_format_bytes(image_data);
     let ext = image_format_extension(format).to_string();
     let file_path = generate_image_file_path(storage_path, source, &ext)?;
@@ -356,7 +375,9 @@ fn decode_image_clip(content: &str) -> Result<(Vec<u8>, usize, usize), String> {
         .split_once(",")
         .map(|(_, b64)| b64.to_string())
         .unwrap_or_else(|| content.to_string());
-    let image_bytes = BASE64.decode(base64_data).map_err(|e| format!("Failed to decode image data: {}", e))?;
+    let image_bytes = BASE64
+        .decode(base64_data)
+        .map_err(|e| format!("Failed to decode image data: {}", e))?;
     let image = image::load_from_memory(&image_bytes)
         .map_err(|e| format!("Failed to parse image data: {}", e))?
         .to_rgba8();
@@ -412,10 +433,10 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
             let mut last_hash = state.last_image_hash.lock().unwrap();
             *last_hash = Some(image_hash);
         }
-        
+
         loop {
             let is_paused = *state.is_paused.lock().unwrap();
-            
+
             if !is_paused {
                 // 检查文本剪贴板
                 match clipboard.get_text() {
@@ -434,37 +455,55 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                             if let Some(ref last) = *last_clip {
                                 if last != &text {
                                     drop(last_clip);
-                                    let source = capture_frontmost_app_name().unwrap_or_else(|| "Unknown".to_string());
+                                    let source = capture_frontmost_app_name()
+                                        .unwrap_or_else(|| "Unknown".to_string());
                                     let ignore_source = {
                                         let settings = state.settings.lock().unwrap();
-                                        settings.ignore_password_managers && is_password_manager_source(&source)
+                                        settings.ignore_password_managers
+                                            && is_password_manager_source(&source)
                                     };
                                     if ignore_source {
                                         let mut last_clip = state.last_clip.lock().unwrap();
                                         *last_clip = Some(text.clone());
                                     } else {
-                                        save_clip(&state, Some(&app), text, "text".to_string(), source, None);
+                                        save_clip(
+                                            &state,
+                                            Some(&app),
+                                            text,
+                                            "text".to_string(),
+                                            source,
+                                            None,
+                                        );
                                     }
                                 }
                             } else {
                                 drop(last_clip);
-                                let source = capture_frontmost_app_name().unwrap_or_else(|| "Unknown".to_string());
+                                let source = capture_frontmost_app_name()
+                                    .unwrap_or_else(|| "Unknown".to_string());
                                 let ignore_source = {
                                     let settings = state.settings.lock().unwrap();
-                                    settings.ignore_password_managers && is_password_manager_source(&source)
+                                    settings.ignore_password_managers
+                                        && is_password_manager_source(&source)
                                 };
                                 if ignore_source {
                                     let mut last_clip = state.last_clip.lock().unwrap();
                                     *last_clip = Some(text.clone());
                                 } else {
-                                    save_clip(&state, Some(&app), text, "text".to_string(), source, None);
+                                    save_clip(
+                                        &state,
+                                        Some(&app),
+                                        text,
+                                        "text".to_string(),
+                                        source,
+                                        None,
+                                    );
                                 }
                             }
                         }
                     }
                     Err(_) => {}
                 }
-                
+
                 // 检查图片剪贴板
                 let plain_text_only = {
                     let settings = state.settings.lock().unwrap();
@@ -479,12 +518,12 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                     Ok(image_data) => {
                         use std::collections::hash_map::DefaultHasher;
                         use std::hash::{Hash, Hasher};
-                        
+
                         // 计算图片哈希用于去重
                         let mut hasher = DefaultHasher::new();
                         image_data.bytes.hash(&mut hasher);
                         let image_hash = hasher.finish();
-                        
+
                         let last_hash = state.last_image_hash.lock().unwrap();
                         if let Some(ref last) = *last_hash {
                             if last != &image_hash {
@@ -497,15 +536,24 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                                         continue;
                                     }
                                 };
-                                let source = capture_frontmost_app_name().unwrap_or_else(|| "Clipboard".to_string());
+                                let source = capture_frontmost_app_name()
+                                    .unwrap_or_else(|| "Clipboard".to_string());
                                 let ignore_source = {
                                     let settings = state.settings.lock().unwrap();
-                                    settings.ignore_password_managers && is_password_manager_source(&source)
+                                    settings.ignore_password_managers
+                                        && is_password_manager_source(&source)
                                 };
                                 if !ignore_source {
-                                    save_clip(&state, Some(&app), base64_data, "image".to_string(), source, Some("png".to_string()));
+                                    save_clip(
+                                        &state,
+                                        Some(&app),
+                                        base64_data,
+                                        "image".to_string(),
+                                        source,
+                                        Some("png".to_string()),
+                                    );
                                 }
-                                
+
                                 // 更新哈希
                                 let mut last_hash_mut = state.last_image_hash.lock().unwrap();
                                 *last_hash_mut = Some(image_hash);
@@ -520,15 +568,24 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                                     continue;
                                 }
                             };
-                            let source = capture_frontmost_app_name().unwrap_or_else(|| "Clipboard".to_string());
+                            let source = capture_frontmost_app_name()
+                                .unwrap_or_else(|| "Clipboard".to_string());
                             let ignore_source = {
                                 let settings = state.settings.lock().unwrap();
-                                settings.ignore_password_managers && is_password_manager_source(&source)
+                                settings.ignore_password_managers
+                                    && is_password_manager_source(&source)
                             };
                             if !ignore_source {
-                                save_clip(&state, Some(&app), base64_data, "image".to_string(), source, Some("png".to_string()));
+                                save_clip(
+                                    &state,
+                                    Some(&app),
+                                    base64_data,
+                                    "image".to_string(),
+                                    source,
+                                    Some("png".to_string()),
+                                );
                             }
-                            
+
                             let mut last_hash_mut = state.last_image_hash.lock().unwrap();
                             *last_hash_mut = Some(image_hash);
                         }
@@ -536,13 +593,20 @@ fn start_clipboard_monitor(app: tauri::AppHandle, state: Arc<AppState>) {
                     Err(_) => {}
                 }
             }
-            
+
             thread::sleep(Duration::from_millis(500));
         }
     });
 }
 
-fn save_clip(state: &AppState, app: Option<&tauri::AppHandle>, content: String, clip_type: String, source: String, file_ext: Option<String>) {
+fn save_clip(
+    state: &AppState,
+    app: Option<&tauri::AppHandle>,
+    content: String,
+    clip_type: String,
+    source: String,
+    file_ext: Option<String>,
+) {
     save_clip_with_path(state, app, content, clip_type, source, None, file_ext);
 }
 
@@ -569,6 +633,49 @@ fn remove_duplicate_rows_for_clip(
     )
 }
 
+fn refresh_clip_from_latest_duplicate(
+    conn: &Connection,
+    keep_id: &str,
+    clip_type: &str,
+    content: &str,
+) -> Result<(), rusqlite::Error> {
+    let latest_row = conn.query_row(
+        "SELECT category, preview, timestamp, source, file_path, file_ext
+         FROM clips
+         WHERE clip_type = ?1 AND content = ?2
+         ORDER BY timestamp DESC, rowid DESC
+         LIMIT 1",
+        params![clip_type, content],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        },
+    )?;
+
+    conn.execute(
+        "UPDATE clips
+         SET category = ?1, preview = ?2, timestamp = ?3, source = ?4, file_path = ?5, file_ext = ?6
+         WHERE id = ?7",
+        params![
+            latest_row.0,
+            latest_row.1,
+            latest_row.2,
+            latest_row.3,
+            latest_row.4,
+            latest_row.5,
+            keep_id
+        ],
+    )?;
+
+    Ok(())
+}
+
 fn dedupe_existing_clips(conn: &Connection) -> Result<usize, rusqlite::Error> {
     let mut duplicates = conn.prepare(
         "SELECT clip_type, content
@@ -588,12 +695,13 @@ fn dedupe_existing_clips(conn: &Connection) -> Result<usize, rusqlite::Error> {
             "SELECT id
              FROM clips
              WHERE clip_type = ?1 AND content = ?2
-             ORDER BY timestamp DESC, rowid DESC
+             ORDER BY rowid ASC
              LIMIT 1",
             params![&clip_type, &content],
             |row| row.get::<_, String>(0),
         )?;
 
+        refresh_clip_from_latest_duplicate(conn, &keep_id, &clip_type, &content)?;
         removed += remove_duplicate_rows_for_clip(conn, &keep_id, &clip_type, &content)?;
     }
 
@@ -618,7 +726,10 @@ fn save_clip_with_path(
     let mut clear_auto_pin = false;
     {
         let mut auto_pinned_signature = state.auto_pinned_signature.lock().unwrap();
-        if auto_pinned_signature.as_ref().is_some_and(|value| *value != signature) {
+        if auto_pinned_signature
+            .as_ref()
+            .is_some_and(|value| *value != signature)
+        {
             *auto_pinned_signature = None;
             clear_auto_pin = true;
         }
@@ -630,7 +741,7 @@ fn save_clip_with_path(
             "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext
              FROM clips
              WHERE clip_type = ?1 AND content = ?2
-             ORDER BY timestamp DESC
+             ORDER BY rowid ASC
              LIMIT 1",
             params![clip_type, content],
             |row| {
@@ -664,7 +775,9 @@ fn save_clip_with_path(
                 return;
             }
 
-            if let Err(e) = remove_duplicate_rows_for_clip(&conn, &clip.id, &clip.clip_type, &clip.content) {
+            if let Err(e) =
+                remove_duplicate_rows_for_clip(&conn, &clip.id, &clip.clip_type, &clip.content)
+            {
                 eprintln!("Failed to remove duplicate rows for promoted clip: {}", e);
             }
 
@@ -700,7 +813,11 @@ fn save_clip_with_path(
                 file_ext: file_ext.clone(),
             };
 
-            eprintln!("insert clip: type={} source={}", clip.clip_type, clip.source.clone().unwrap_or_default());
+            eprintln!(
+                "insert clip: type={} source={}",
+                clip.clip_type,
+                clip.source.clone().unwrap_or_default()
+            );
             if let Err(e) = conn.execute(
                 "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -749,7 +866,9 @@ fn detect_category(content: &str) -> Option<String> {
         return Some("Links".to_string());
     }
 
-    if matches!(trimmed.chars().next(), Some('{') | Some('[')) && serde_json::from_str::<Value>(trimmed).is_ok() {
+    if matches!(trimmed.chars().next(), Some('{') | Some('['))
+        && serde_json::from_str::<Value>(trimmed).is_ok()
+    {
         return Some("JSON".to_string());
     }
 
@@ -849,8 +968,7 @@ fn cleanup_history(state: &AppState) {
     let conn = state.db.lock().unwrap();
 
     if settings.history_retention_days > 0 {
-        let cutoff = Utc::now()
-            .timestamp_millis()
+        let cutoff = Utc::now().timestamp_millis()
             - (settings.history_retention_days as i64 * 24 * 60 * 60 * 1000);
         let _ = conn.execute("DELETE FROM clips WHERE timestamp < ?1", params![cutoff]);
     }
@@ -865,8 +983,7 @@ fn cleanup_history(state: &AppState) {
     }
 
     if settings.recycle_bin_retention_days > 0 {
-        let recycle_cutoff = Utc::now()
-            .timestamp_millis()
+        let recycle_cutoff = Utc::now().timestamp_millis()
             - (settings.recycle_bin_retention_days as i64 * 24 * 60 * 60 * 1000);
         let _ = conn.execute(
             "DELETE FROM deleted_clips WHERE deleted_at < ?1",
@@ -892,7 +1009,11 @@ fn normalize_shortcut(input: &str) -> String {
         .replace("Meta", "CmdOrCtrl")
 }
 
-fn write_clip_to_system_clipboard(state: &AppState, content: &str, clip_type: &str) -> Result<(), String> {
+fn write_clip_to_system_clipboard(
+    state: &AppState,
+    content: &str,
+    clip_type: &str,
+) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
     if clip_type == "text" || clip_type == "image" {
@@ -1018,7 +1139,7 @@ fn capture_frontmost_app_bundle_id() -> Option<String> {
 fn toggle_main_window(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
         if window.is_visible().map_err(|e| e.to_string())? {
-            window.hide().map_err(|e| e.to_string())?;
+            hide_main_window(app)?;
         } else {
             remember_frontmost_app(app);
             show_main_window(app)?;
@@ -1058,12 +1179,17 @@ fn quick_paste_latest_clip(state: &Arc<AppState>) -> Result<(), String> {
 fn paste_active_app(target_bundle_id: Option<String>) -> Result<(), String> {
     let mut script_lines = Vec::new();
     if let Some(bundle_id) = target_bundle_id {
-        script_lines.push(format!(r#"tell application id "{}" to activate"#, bundle_id.replace('"', "\\\"")));
+        script_lines.push(format!(
+            r#"tell application id "{}" to activate"#,
+            bundle_id.replace('"', "\\\"")
+        ));
         script_lines.push("delay 0.22".to_string());
     } else {
         script_lines.push("delay 0.16".to_string());
     }
-    script_lines.push(r#"tell application "System Events" to keystroke "v" using command down"#.to_string());
+    script_lines.push(
+        r#"tell application "System Events" to keystroke "v" using command down"#.to_string(),
+    );
 
     let output = Command::new("osascript")
         .args(script_lines.iter().flat_map(|line| ["-e", line.as_str()]))
@@ -1098,7 +1224,21 @@ fn paste_active_app(_target_bundle_id: Option<String>) -> Result<(), String> {
     Err("Direct paste is only implemented on macOS and Windows".to_string())
 }
 
-fn apply_toggle_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: String) -> Result<(), String> {
+fn direct_paste_active_app(target_bundle_id: Option<String>) -> Result<(), String> {
+    paste_active_app(target_bundle_id).map_err(|err| {
+        if err.trim().is_empty() {
+            "Failed to paste into active app".to_string()
+        } else {
+            err
+        }
+    })
+}
+
+fn apply_toggle_shortcut(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    shortcut_raw: String,
+) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     let shortcut = normalize_shortcut(&shortcut_raw);
@@ -1125,7 +1265,11 @@ fn apply_toggle_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: S
     Ok(())
 }
 
-fn apply_screenshot_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: String) -> Result<(), String> {
+fn apply_screenshot_shortcut(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    shortcut_raw: String,
+) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     let shortcut = normalize_shortcut(&shortcut_raw);
@@ -1153,7 +1297,11 @@ fn apply_screenshot_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_ra
     Ok(())
 }
 
-fn apply_quick_paste_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: String) -> Result<(), String> {
+fn apply_quick_paste_shortcut(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    shortcut_raw: String,
+) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     let shortcut = normalize_shortcut(&shortcut_raw);
@@ -1181,7 +1329,11 @@ fn apply_quick_paste_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_r
     Ok(())
 }
 
-fn apply_clear_history_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut_raw: String) -> Result<(), String> {
+fn apply_clear_history_shortcut(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    shortcut_raw: String,
+) -> Result<(), String> {
     use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
     let shortcut = normalize_shortcut(&shortcut_raw);
@@ -1216,23 +1368,27 @@ fn apply_clear_history_shortcut(app: &AppHandle, state: &Arc<AppState>, shortcut
 #[tauri::command]
 fn get_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec<Clip> {
     let conn = state.db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext
-         FROM clips ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
-    ).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext
+         FROM clips ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2",
+        )
+        .unwrap();
 
-    let clips = stmt.query_map(params![limit, offset], |row| {
-        Ok(Clip {
-            id: row.get(0)?,
-            clip_type: row.get(1)?,
-            category: row.get(2)?,
-            content: row.get(3)?,
-            preview: row.get(4)?,
-            timestamp: row.get(5)?,
-            source: row.get(6)?,
-            file_ext: row.get(7)?,
+    let clips = stmt
+        .query_map(params![limit, offset], |row| {
+            Ok(Clip {
+                id: row.get(0)?,
+                clip_type: row.get(1)?,
+                category: row.get(2)?,
+                content: row.get(3)?,
+                preview: row.get(4)?,
+                timestamp: row.get(5)?,
+                source: row.get(6)?,
+                file_ext: row.get(7)?,
+            })
         })
-    }).unwrap();
+        .unwrap();
 
     let mut result = Vec::new();
     for clip in clips {
@@ -1242,7 +1398,11 @@ fn get_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec
 }
 
 #[tauri::command]
-fn get_deleted_clips(state: tauri::State<Arc<AppState>>, limit: i32, offset: i32) -> Vec<DeletedClip> {
+fn get_deleted_clips(
+    state: tauri::State<Arc<AppState>>,
+    limit: i32,
+    offset: i32,
+) -> Vec<DeletedClip> {
     let conn = state.db.lock().unwrap();
     let mut stmt = conn
         .prepare(
@@ -1313,7 +1473,8 @@ fn restore_deleted_clip(state: tauri::State<Arc<AppState>>, id: String) -> Resul
         .optional()
         .map_err(|e| e.to_string())?;
 
-    let Some((clip_type, category, content, preview, source, file_path, file_ext)) = deleted_item else {
+    let Some((clip_type, category, content, preview, source, file_path, file_ext)) = deleted_item
+    else {
         return Err("Deleted clip not found".to_string());
     };
 
@@ -1322,7 +1483,7 @@ fn restore_deleted_clip(state: tauri::State<Arc<AppState>>, id: String) -> Resul
             "SELECT id
              FROM clips
              WHERE clip_type = ?1 AND content = ?2
-             ORDER BY timestamp DESC, rowid DESC
+             ORDER BY rowid ASC
              LIMIT 1",
             params![&clip_type, &content],
             |row| row.get(0),
@@ -1354,7 +1515,8 @@ fn restore_deleted_clip(state: tauri::State<Arc<AppState>>, id: String) -> Resul
         )
         .map_err(|e| e.to_string())?;
 
-        remove_duplicate_rows_for_clip(&conn, &restore_id, &clip_type, &content).map_err(|e| e.to_string())?;
+        remove_duplicate_rows_for_clip(&conn, &restore_id, &clip_type, &content)
+            .map_err(|e| e.to_string())?;
     } else {
         conn.execute(
             "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source, file_path, file_ext)
@@ -1407,29 +1569,39 @@ fn clear_all_clips(state: tauri::State<Arc<AppState>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn write_to_clipboard(state: tauri::State<Arc<AppState>>, content: String, clip_type: String) -> Result<(), String> {
+fn write_to_clipboard(
+    state: tauri::State<Arc<AppState>>,
+    content: String,
+    clip_type: String,
+) -> Result<(), String> {
     write_clip_to_system_clipboard(state.as_ref(), &content, &clip_type)
 }
 
 #[tauri::command]
-fn paste_clip(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, content: String, clip_type: String) -> Result<(), String> {
+fn paste_clip(
+    app: tauri::AppHandle,
+    state: tauri::State<Arc<AppState>>,
+    content: String,
+    clip_type: String,
+) -> Result<(), String> {
     let target_bundle_id = state.last_frontmost_app.lock().unwrap().clone();
-    let should_direct_paste = clip_type == "text";
+    let should_direct_paste = clip_type == "text" || clip_type == "image";
     write_to_clipboard(state, content, clip_type)?;
     if should_direct_paste {
-        hide_window(app)?;
-        thread::spawn(move || {
-            if let Err(err) = paste_active_app(target_bundle_id) {
-                eprintln!("Failed to paste into active app: {}", err);
-            }
-        });
+        hide_main_window(&app)?;
+        direct_paste_active_app(target_bundle_id)?;
     }
     Ok(())
 }
 
 fn tray_menu_labels(language: &str) -> (&'static str, &'static str, &'static str, &'static str) {
     if language.eq_ignore_ascii_case("en") {
-        ("Open Clipboard", "Pause Recording", "Settings", "Quit PPaste")
+        (
+            "Open Clipboard",
+            "Pause Recording",
+            "Settings",
+            "Quit PPaste",
+        )
     } else {
         ("打开剪贴板", "暂停记录", "设置", "退出 PPaste")
     }
@@ -1444,7 +1616,11 @@ fn build_tray_menu(app: &AppHandle, language: &str) -> Result<Menu<tauri::Wry>, 
     Menu::with_items(app, &[&show, &pause, &settings, &quit])
 }
 
-fn update_tray_menu_language(app: &AppHandle, state: &Arc<AppState>, language: &str) -> Result<(), String> {
+fn update_tray_menu_language(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    language: &str,
+) -> Result<(), String> {
     let tray = app
         .tray_by_id(&state.tray_id)
         .ok_or_else(|| "Tray icon not found".to_string())?;
@@ -1459,7 +1635,11 @@ fn get_settings(state: tauri::State<Arc<AppState>>) -> Settings {
 }
 
 #[tauri::command]
-fn update_settings(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, settings: Settings) -> Result<(), String> {
+fn update_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<Arc<AppState>>,
+    settings: Settings,
+) -> Result<(), String> {
     let next_settings = settings.clone();
     {
         let mut current_settings = state.settings.lock().unwrap();
@@ -1524,9 +1704,23 @@ fn get_pause_recording(state: tauri::State<Arc<AppState>>) -> bool {
 
 #[tauri::command]
 fn hide_window(app: tauri::AppHandle) -> Result<(), String> {
+    hide_main_window(&app)
+}
+
+fn hide_main_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        let mut awaiting_focus_after_show = state.awaiting_focus_after_show.lock().unwrap();
+        *awaiting_focus_after_show = false;
+    }
+
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| e.to_string())?;
     }
+
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory)
+        .map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -1606,7 +1800,10 @@ fn reveal_path(path: String) -> Result<(), String> {
             .arg(if target_path.is_dir() {
                 target_path.as_os_str()
             } else {
-                target_path.parent().unwrap_or_else(|| std::path::Path::new(".")).as_os_str()
+                target_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .as_os_str()
             })
             .status()
             .map_err(|e| format!("Failed to open path: {}", e))?;
@@ -1679,22 +1876,21 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
     } else {
         false
     };
-    
+
     let settings = state.settings.lock().unwrap();
     let storage_path = settings.storage_path.clone();
     drop(settings);
-    
-    
-    
+
     // 跨平台截图支持
     #[cfg(target_os = "macos")]
     {
         let temp_path = "/tmp/ppaste_screenshot.png";
-        
+        let _ = std::fs::remove_file(temp_path);
+
         // 使用 screencapture 命令
         let use_interactive = std::env::var("PPASTE_SCREENSHOT_INTERACTIVE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let mut cmd = Command::new("screencapture");
         if use_interactive {
             cmd.args(["-i", "-x", temp_path]);
@@ -1705,18 +1901,26 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
         let output = cmd
             .output()
             .map_err(|e| format!("Failed to capture screen: {}", e))?;
-        
+
         if output.status.success() {
             // 读取图片
             let png_bytes = std::fs::read(temp_path).map_err(|e| e.to_string())?;
-            
+
             // 保存到存储路径
             let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
             let base64_data = BASE64.encode(&png_bytes);
-            
+
             // 保存到历史（同时记录文件路径）
-            save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(file_path), Some(file_ext));
-            
+            save_clip_with_path(
+                state,
+                Some(app),
+                base64_data.clone(),
+                "image".to_string(),
+                SCREENSHOT_SOURCE.to_string(),
+                Some(file_path),
+                Some(file_ext),
+            );
+
             // 清理临时文件
             let _ = std::fs::remove_file(temp_path);
             if should_restore_window {
@@ -1724,7 +1928,7 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
                 let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
                 let _ = show_main_window(app);
             }
-            
+
             return Ok(format!("data:image/png;base64,{}", base64_data));
         } else {
             if should_restore_window {
@@ -1732,10 +1936,13 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
                 let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
                 let _ = show_main_window(app);
             }
+            if !std::path::Path::new(temp_path).exists() {
+                return Err("Screenshot cancelled".to_string());
+            }
             return Err("Screenshot command failed".to_string());
         }
     }
-    
+
     #[cfg(target_os = "windows")]
     {
         use image::{ImageBuffer, Rgba};
@@ -1848,7 +2055,7 @@ $bitmap.Dispose()
             Some(app),
             base64_data.clone(),
             "image".to_string(),
-            "PPaste".to_string(),
+            SCREENSHOT_SOURCE.to_string(),
             Some(file_path),
             Some(file_ext),
         );
@@ -1863,24 +2070,31 @@ $bitmap.Dispose()
     #[cfg(target_os = "linux")]
     {
         let temp_path = "/tmp/ppaste_screenshot.png";
-        
+
         // 尝试使用 scrot 或 gnome-screenshot
-        let output = Command::new("scrot")
-            .arg(temp_path)
-            .output();
-        
+        let output = Command::new("scrot").arg(temp_path).output();
+
         match output {
             Ok(out) if out.status.success() => {
                 let png_bytes = std::fs::read(temp_path).map_err(|e| e.to_string())?;
-                let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
+                let (file_path, file_ext) =
+                    save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
                 let base64_data = BASE64.encode(&png_bytes);
-                
-                save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(file_path), Some(file_ext));
+
+                save_clip_with_path(
+                    state,
+                    Some(app),
+                    base64_data.clone(),
+                    "image".to_string(),
+                    SCREENSHOT_SOURCE.to_string(),
+                    Some(file_path),
+                    Some(file_ext),
+                );
                 let _ = std::fs::remove_file(temp_path);
                 if should_restore_window {
                     let _ = show_main_window(app);
                 }
-                
+
                 return Ok(format!("data:image/png;base64,{}", base64_data));
             }
             _ => {
@@ -1889,29 +2103,41 @@ $bitmap.Dispose()
                     .args(["-f", temp_path])
                     .output()
                     .map_err(|e| format!("Failed to capture screen: {}", e))?;
-                
+
                 if output2.status.success() {
                     let png_bytes = std::fs::read(temp_path).map_err(|e| e.to_string())?;
-                    let (file_path, file_ext) = save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
+                    let (file_path, file_ext) =
+                        save_image_to_storage(&storage_path, &png_bytes, "PPaste")?;
                     let base64_data = BASE64.encode(&png_bytes);
-                    
-                    save_clip_with_path(state, Some(app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(file_path), Some(file_ext));
+
+                    save_clip_with_path(
+                        state,
+                        Some(app),
+                        base64_data.clone(),
+                        "image".to_string(),
+                        SCREENSHOT_SOURCE.to_string(),
+                        Some(file_path),
+                        Some(file_ext),
+                    );
                     let _ = std::fs::remove_file(temp_path);
                     if should_restore_window {
                         let _ = show_main_window(app);
                     }
-                    
+
                     return Ok(format!("data:image/png;base64,{}", base64_data));
                 } else {
                     if should_restore_window {
                         let _ = show_main_window(app);
                     }
-                    return Err("No screenshot tool found (try installing scrot or gnome-screenshot)".to_string());
+                    return Err(
+                        "No screenshot tool found (try installing scrot or gnome-screenshot)"
+                            .to_string(),
+                    );
                 }
             }
         }
     }
-    
+
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         if should_restore_window {
@@ -1922,19 +2148,35 @@ $bitmap.Dispose()
 }
 
 #[tauri::command]
-fn take_screenshot(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) -> Result<String, String> {
+fn take_screenshot(
+    app: tauri::AppHandle,
+    state: tauri::State<Arc<AppState>>,
+) -> Result<String, String> {
     capture_screenshot_to_history(&app, state.as_ref())
 }
 
 #[tauri::command]
-fn save_image_from_clipboard(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) -> Result<String, String> {
+fn save_image_from_clipboard(
+    app: tauri::AppHandle,
+    state: tauri::State<Arc<AppState>>,
+) -> Result<String, String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
 
     match clipboard.get_image() {
         Ok(image_data) => {
             let (image_bytes, base64_data) = encode_clipboard_image(&image_data)?;
-            save_clip(&state, Some(&app), base64_data.clone(), "image".to_string(), "PPaste".to_string(), Some(image_format_extension(detect_image_format_bytes(&image_bytes)).to_string()));
-            let mime = format!("image/{}", image_format_extension(detect_image_format_bytes(&image_bytes)));
+            save_clip(
+                &state,
+                Some(&app),
+                base64_data.clone(),
+                "image".to_string(),
+                "PPaste".to_string(),
+                Some(image_format_extension(detect_image_format_bytes(&image_bytes)).to_string()),
+            );
+            let mime = format!(
+                "image/{}",
+                image_format_extension(detect_image_format_bytes(&image_bytes))
+            );
             Ok(format!("data:{};base64,{}", mime, base64_data))
         }
         Err(e) => Err(format!("No image in clipboard: {}", e)),
@@ -1944,18 +2186,24 @@ fn save_image_from_clipboard(app: tauri::AppHandle, state: tauri::State<Arc<AppS
 #[tauri::command]
 fn get_image_data(clip_id: String, state: tauri::State<Arc<AppState>>) -> Result<String, String> {
     let conn = state.db.lock().unwrap();
-    
-    let content: String = conn.query_row(
-        "SELECT content FROM clips WHERE id = ?1",
-        params![clip_id],
-        |row| row.get(0)
-    ).map_err(|e| format!("Clip not found: {}", e))?;
-    
+
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM clips WHERE id = ?1",
+            params![clip_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Clip not found: {}", e))?;
+
     Ok(content) // Base64 编码的图片数据
 }
 
 #[tauri::command]
-fn export_image(clip_id: String, file_path: String, state: tauri::State<Arc<AppState>>) -> Result<(), String> {
+fn export_image(
+    clip_id: String,
+    file_path: String,
+    state: tauri::State<Arc<AppState>>,
+) -> Result<(), String> {
     let raw = get_image_data(clip_id, state)?;
     let base64_data = raw
         .split_once(",")
@@ -1981,64 +2229,73 @@ pub struct ExportData {
 fn export_clips(state: tauri::State<Arc<AppState>>, file_path: String) -> Result<usize, String> {
     let conn = state.db.lock().unwrap();
     let settings = state.settings.lock().unwrap();
-    
+
     // 获取所有剪贴板记录
     let mut stmt = conn.prepare(
         "SELECT id, clip_type, category, content, preview, timestamp, source, file_ext FROM clips ORDER BY timestamp DESC"
     ).map_err(|e| e.to_string())?;
-    
-    let clips = stmt.query_map([], |row| {
-        Ok(Clip {
-            id: row.get(0)?,
-            clip_type: row.get(1)?,
-            category: row.get(2)?,
-            content: row.get(3)?,
-            preview: row.get(4)?,
-            timestamp: row.get(5)?,
-            source: row.get(6)?,
-            file_ext: row.get(7)?,
+
+    let clips = stmt
+        .query_map([], |row| {
+            Ok(Clip {
+                id: row.get(0)?,
+                clip_type: row.get(1)?,
+                category: row.get(2)?,
+                content: row.get(3)?,
+                preview: row.get(4)?,
+                timestamp: row.get(5)?,
+                source: row.get(6)?,
+                file_ext: row.get(7)?,
+            })
         })
-    }).map_err(|e| e.to_string())?;
-    
+        .map_err(|e| e.to_string())?;
+
     let mut clips_vec = Vec::new();
     for clip in clips {
         clips_vec.push(clip.unwrap());
     }
-    
+
     let export_data = ExportData {
         version: "1.0".to_string(),
         export_date: Utc::now().timestamp_millis(),
         clips: clips_vec.clone(),
         settings: settings.clone(),
     };
-    
+
     let json = serde_json::to_string_pretty(&export_data).map_err(|e| e.to_string())?;
     std::fs::write(&file_path, json).map_err(|e| e.to_string())?;
-    
+
     Ok(clips_vec.len())
 }
 
 #[tauri::command]
-fn import_clips(state: tauri::State<Arc<AppState>>, file_path: String, merge: bool) -> Result<usize, String> {
+fn import_clips(
+    state: tauri::State<Arc<AppState>>,
+    file_path: String,
+    merge: bool,
+) -> Result<usize, String> {
     let json_content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
     let export_data: ExportData = serde_json::from_str(&json_content).map_err(|e| e.to_string())?;
-    
+
     let conn = state.db.lock().unwrap();
     let mut count = 0;
-    
+
     if !merge {
         // 清空现有数据
-        conn.execute("DELETE FROM clips", []).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM clips", [])
+            .map_err(|e| e.to_string())?;
     }
-    
+
     for clip in export_data.clips {
         // 检查是否已存在
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
-            params![clip.id],
-            |row| row.get(0)
-        ).unwrap_or(false);
-        
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
+                params![clip.id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
         if !exists {
             conn.execute(
                 "INSERT INTO clips (id, clip_type, category, content, preview, timestamp, source)
@@ -2052,7 +2309,8 @@ fn import_clips(state: tauri::State<Arc<AppState>>, file_path: String, merge: bo
                     clip.timestamp,
                     clip.source
                 ],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
             count += 1;
         }
     }
@@ -2060,7 +2318,7 @@ fn import_clips(state: tauri::State<Arc<AppState>>, file_path: String, merge: bo
     dedupe_existing_clips(&conn).map_err(|e| e.to_string())?;
     drop(conn);
     cleanup_history(state.inner().as_ref());
-    
+
     Ok(count)
 }
 
@@ -2104,14 +2362,19 @@ fn export_clips_json(state: tauri::State<Arc<AppState>>) -> Result<String, Strin
 }
 
 #[tauri::command]
-fn import_clips_json(state: tauri::State<Arc<AppState>>, payload: String, merge: bool) -> Result<usize, String> {
+fn import_clips_json(
+    state: tauri::State<Arc<AppState>>,
+    payload: String,
+    merge: bool,
+) -> Result<usize, String> {
     let export_data: ExportData = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
 
     let conn = state.db.lock().unwrap();
     let mut count = 0;
 
     if !merge {
-        conn.execute("DELETE FROM clips", []).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM clips", [])
+            .map_err(|e| e.to_string())?;
     }
 
     for clip in export_data.clips {
@@ -2152,25 +2415,21 @@ fn import_clips_json(state: tauri::State<Arc<AppState>>, payload: String, merge:
 #[tauri::command]
 fn get_stats(state: tauri::State<Arc<AppState>>) -> Result<serde_json::Value, String> {
     let conn = state.db.lock().unwrap();
-    
-    let total_clips: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM clips",
-        [],
-        |row| row.get(0)
-    ).map_err(|e| e.to_string())?;
-    
-    let total_size: i64 = conn.query_row(
-        "SELECT SUM(length(content)) FROM clips",
-        [],
-        |row| row.get(0)
-    ).map_err(|e| e.to_string())?;
-    
-    let oldest_clip: Option<i64> = conn.query_row(
-        "SELECT MIN(timestamp) FROM clips",
-        [],
-        |row| row.get(0)
-    ).ok();
-    
+
+    let total_clips: i64 = conn
+        .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+
+    let total_size: i64 = conn
+        .query_row("SELECT SUM(length(content)) FROM clips", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let oldest_clip: Option<i64> = conn
+        .query_row("SELECT MIN(timestamp) FROM clips", [], |row| row.get(0))
+        .ok();
+
     Ok(serde_json::json!({
         "total_clips": total_clips,
         "total_size_bytes": total_size,
@@ -2188,14 +2447,14 @@ pub fn run() {
 
     // 获取数据库路径
     let db_path = app_data_dir().join("clips.db");
-    
+
     // 确保目录存在
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-    
+
     // 初始化数据库
     let conn = init_db(db_path.to_str().unwrap()).expect("Failed to initialize database");
     dedupe_existing_clips(&conn).expect("Failed to dedupe existing clips");
-    
+
     let default_settings = load_settings(&conn);
     let app_state = Arc::new(AppState {
         db: Arc::new(Mutex::new(conn)),
@@ -2204,10 +2463,18 @@ pub fn run() {
         last_clip: Arc::new(Mutex::new(None)),
         suppressed_text: Arc::new(Mutex::new(None)),
         last_image_hash: Arc::new(Mutex::new(None)),
-        active_screenshot_shortcut: Arc::new(Mutex::new(default_settings.screenshot_shortcut.clone())),
-        active_toggle_shortcut: Arc::new(Mutex::new(default_settings.toggle_window_shortcut.clone())),
-        active_quick_paste_shortcut: Arc::new(Mutex::new(default_settings.quick_paste_shortcut.clone())),
-        active_clear_history_shortcut: Arc::new(Mutex::new(default_settings.clear_history_shortcut.clone())),
+        active_screenshot_shortcut: Arc::new(Mutex::new(
+            default_settings.screenshot_shortcut.clone(),
+        )),
+        active_toggle_shortcut: Arc::new(Mutex::new(
+            default_settings.toggle_window_shortcut.clone(),
+        )),
+        active_quick_paste_shortcut: Arc::new(Mutex::new(
+            default_settings.quick_paste_shortcut.clone(),
+        )),
+        active_clear_history_shortcut: Arc::new(Mutex::new(
+            default_settings.clear_history_shortcut.clone(),
+        )),
         awaiting_focus_after_show: Arc::new(Mutex::new(false)),
         last_frontmost_app: Arc::new(Mutex::new(None)),
         duplicate_hit_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -2215,7 +2482,7 @@ pub fn run() {
         tray_id: "main-tray".to_string(),
     });
     cleanup_history(&app_state);
-    
+
     // 剪贴板监控在 setup 后启动
 
     tauri::Builder::default()
@@ -2238,11 +2505,13 @@ pub fn run() {
 
             // 创建托盘图标
             let _tray = TrayIconBuilder::with_id(&app_state.tray_id)
-                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?)
+                .icon(tauri::image::Image::from_bytes(include_bytes!(
+                    "../icons/tray-template.png"
+                ))?)
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                                .on_menu_event({
+                .on_menu_event({
                     let app_state = Arc::clone(&app_state);
                     move |app, event| match event.id.as_ref() {
                         "show" => {
@@ -2299,14 +2568,14 @@ pub fn run() {
 
             // 启动剪贴板监控（需要 AppHandle 用于事件推送）
             start_clipboard_monitor(app.handle().clone(), Arc::clone(&app_state));
-            
+
             // 注册全局快捷键（支持设置页动态修改）
             let screenshot_shortcut = {
                 app_state
                     .settings
                     .lock()
                     .map(|s| s.screenshot_shortcut.clone())
-                    .unwrap_or_else(|_| "Alt+S".to_string())
+                    .unwrap_or_else(|_| Settings::default().screenshot_shortcut)
             };
             apply_screenshot_shortcut(app.handle(), &app_state, screenshot_shortcut)?;
             let current_shortcut = {
@@ -2314,7 +2583,7 @@ pub fn run() {
                     .settings
                     .lock()
                     .map(|s| s.toggle_window_shortcut.clone())
-                    .unwrap_or_else(|_| "Alt+X".to_string())
+                    .unwrap_or_else(|_| Settings::default().toggle_window_shortcut)
             };
             apply_toggle_shortcut(app.handle(), &app_state, current_shortcut)?;
             let quick_paste_shortcut = {
@@ -2325,7 +2594,7 @@ pub fn run() {
                     .unwrap_or_else(|_| "CmdOrCtrl+Shift+V".to_string())
             };
             apply_quick_paste_shortcut(app.handle(), &app_state, quick_paste_shortcut)?;
-            
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2337,7 +2606,8 @@ pub fn run() {
 
             if let WindowEvent::Focused(true) = event {
                 if let Some(state) = window.try_state::<Arc<AppState>>() {
-                    let mut awaiting_focus_after_show = state.awaiting_focus_after_show.lock().unwrap();
+                    let mut awaiting_focus_after_show =
+                        state.awaiting_focus_after_show.lock().unwrap();
                     *awaiting_focus_after_show = false;
                 }
                 return;
@@ -2345,7 +2615,8 @@ pub fn run() {
 
             if let WindowEvent::Focused(false) = event {
                 if let Some(state) = window.try_state::<Arc<AppState>>() {
-                    let awaiting_focus_after_show = *state.awaiting_focus_after_show.lock().unwrap();
+                    let awaiting_focus_after_show =
+                        *state.awaiting_focus_after_show.lock().unwrap();
                     if awaiting_focus_after_show {
                         return;
                     }
