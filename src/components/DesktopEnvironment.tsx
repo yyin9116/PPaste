@@ -1,4 +1,4 @@
-import { memo, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { memo, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode, type UIEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle,
@@ -40,6 +40,7 @@ import {
   restoreDeletedClip,
   revealPath,
   setRunAtLogin,
+  showWindow,
   takeScreenshot,
   updateSettings,
   updateShortcut,
@@ -55,6 +56,7 @@ type ThemeMode = 'dark' | 'light';
 type ThemePreference = ThemeMode | 'system';
 type Language = 'en' | 'zh';
 type ActiveCategory = 'all' | 'notes' | 'code' | 'links' | 'images' | 'files' | 'recycle';
+type ShortcutPlatform = 'mac' | 'windows' | 'linux';
 
 type SelectOption = {
   label: string;
@@ -72,6 +74,7 @@ interface ClipView {
   source?: string;
   fileExt?: string;
   isPinned: boolean;
+  searchText: string;
 }
 
 function normalizeSource(source?: string) {
@@ -91,6 +94,10 @@ function normalizePathLikeContent(content: string) {
 
 const RECENT_QUERIES_STORAGE_KEY = 'ppaste:recent-queries';
 const PINNED_CLIPS_STORAGE_KEY = 'ppaste:pinned-clips';
+const EMPTY_PINNED_CLIP_IDS = new Set<string>();
+const CLIP_ITEM_HEIGHT = 64;
+const CLIP_ITEM_GAP = 8;
+const CLIP_LIST_OVERSCAN = 8;
 
 function getStoredStringArray(key: string) {
   if (typeof window === 'undefined') return [];
@@ -191,7 +198,8 @@ function resolveClipCategory(clip: BackendClip) {
   return inferDetailedCategory(clip.content, clip.clip_type);
 }
 
-function mapClip(clip: BackendClip, pinnedClipIds: string[], autoPinnedClipId: string | null): ClipView {
+function mapClip(clip: BackendClip, pinnedClipIdSet: ReadonlySet<string>, autoPinnedClipId: string | null): ClipView {
+  const normalizedSource = normalizeSource(clip.source);
   return {
     id: clip.id,
     type: clip.clip_type,
@@ -203,9 +211,10 @@ function mapClip(clip: BackendClip, pinnedClipIds: string[], autoPinnedClipId: s
         ? (clip.content.startsWith('data:') ? clip.content : `data:image/png;base64,${clip.content}`)
         : clip.preview,
     timestamp: clip.deleted_at ?? clip.timestamp,
-    source: normalizeSource(clip.source),
+    source: normalizedSource,
     fileExt: clip.file_ext?.toLowerCase(),
-    isPinned: pinnedClipIds.includes(clip.id) || autoPinnedClipId === clip.id,
+    isPinned: pinnedClipIdSet.has(clip.id) || autoPinnedClipId === clip.id,
+    searchText: `${clip.content}\n${normalizedSource ?? ''}`.toLowerCase(),
   };
 }
 
@@ -228,6 +237,48 @@ function sortClips(clips: ClipView[]) {
   });
 }
 
+function applyPinnedState(clips: ClipView[], pinnedClipIdSet: ReadonlySet<string>, autoPinnedClipId: string | null) {
+  let changed = false;
+  const next = clips.map((clip) => {
+    const isPinned = pinnedClipIdSet.has(clip.id) || autoPinnedClipId === clip.id;
+    if (clip.isPinned === isPinned) {
+      return clip;
+    }
+    changed = true;
+    return { ...clip, isPinned };
+  });
+
+  return changed ? sortClips(next) : clips;
+}
+
+type VirtualListWindow = {
+  startIndex: number;
+  endIndex: number;
+  offsetTop: number;
+  totalHeight: number;
+  rowStride: number;
+};
+
+function getVirtualListWindow(itemCount: number, scrollTop: number, viewportHeight: number, itemHeight: number, itemGap = 0): VirtualListWindow | null {
+  if (itemCount <= 0) return null;
+
+  const rowStride = itemHeight + itemGap;
+  const maxScrollTop = Math.max(0, itemCount * rowStride - itemGap - viewportHeight);
+  const clampedScrollTop = Math.min(Math.max(0, scrollTop), maxScrollTop);
+  const rawStartIndex = Math.floor(clampedScrollTop / rowStride) - CLIP_LIST_OVERSCAN;
+  const startIndex = Math.max(0, Math.min(itemCount - 1, rawStartIndex));
+  const visibleCount = Math.ceil(viewportHeight / rowStride) + CLIP_LIST_OVERSCAN * 2;
+  const endIndex = Math.min(itemCount, startIndex + Math.max(visibleCount, CLIP_LIST_OVERSCAN * 2));
+
+  return {
+    startIndex,
+    endIndex,
+    offsetTop: startIndex * rowStride,
+    totalHeight: itemCount * rowStride - itemGap,
+    rowStride,
+  };
+}
+
 function formatRelativeTime(timestamp: number, language: Language) {
   const rtf = new Intl.RelativeTimeFormat(language, { numeric: 'auto' });
   const diff = timestamp - Date.now();
@@ -240,12 +291,21 @@ function formatRelativeTime(timestamp: number, language: Language) {
   return rtf.format(days, 'day');
 }
 
-function getShortcutDisplayPlatform() {
+function getShortcutDisplayPlatform(): ShortcutPlatform {
   if (typeof navigator === 'undefined') return 'windows';
   const platform = `${navigator.platform} ${navigator.userAgent}`.toLowerCase();
   if (platform.includes('mac')) return 'mac';
   if (platform.includes('win')) return 'windows';
   return 'linux';
+}
+
+function getPlatformDefaultShortcuts(platform: ShortcutPlatform) {
+  return {
+    screenshot_shortcut: platform === 'mac' ? 'Option+S' : 'Alt+S',
+    toggle_window_shortcut: platform === 'mac' ? 'Option+X' : 'Alt+X',
+    quick_paste_shortcut: 'CmdOrCtrl+Shift+V',
+    clear_history_shortcut: 'CmdOrCtrl+Shift+Backspace',
+  };
 }
 
 function shortcutToDisplay(shortcut: string) {
@@ -266,6 +326,86 @@ function shortcutToDisplay(shortcut: string) {
     .replace(/Shift/g, 'Shift')
     .replace(/Ctrl/g, 'Ctrl')
     .replace(/Plus/g, '+');
+}
+
+function shortcutToKeys(shortcut: string) {
+  return shortcut
+    .split('+')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => shortcutToDisplay(part));
+}
+
+function getLaunchAtLoginDescription(language: Language, platform: ShortcutPlatform) {
+  if (language === 'zh') {
+    if (platform === 'mac') return '登录 macOS 时自动启动 PPaste。';
+    if (platform === 'windows') return '登录 Windows 时自动启动 PPaste。';
+    return '登录桌面环境时自动启动 PPaste。';
+  }
+  if (platform === 'mac') return 'Start PPaste automatically when you log in to macOS.';
+  if (platform === 'windows') return 'Start PPaste automatically when you sign in to Windows.';
+  return 'Start PPaste automatically when you sign in to your desktop session.';
+}
+
+function getShortcutHintText(language: Language, platform: ShortcutPlatform, defaults: ReturnType<typeof getPlatformDefaultShortcuts>) {
+  const screenshot = shortcutToDisplay(defaults.screenshot_shortcut);
+  const quickPaste = shortcutToDisplay(defaults.quick_paste_shortcut);
+  if (language === 'zh') {
+    return platform === 'mac'
+      ? `点击快捷键以录制新的按键组合。默认包括 ${screenshot} 截图和 ${quickPaste} 快速粘贴。`
+      : `点击快捷键以录制新的按键组合。默认包括 ${screenshot} 截图和 ${quickPaste} 快速粘贴。`;
+  }
+  return platform === 'mac'
+    ? `Click a shortcut to record a new key combination. Defaults include ${screenshot} for screenshots and ${quickPaste} for quick paste.`
+    : `Click a shortcut to record a new key combination. Defaults include ${screenshot} for screenshots and ${quickPaste} for quick paste.`;
+}
+
+function getRevealPathLabel(language: Language, platform: ShortcutPlatform) {
+  if (language === 'zh') {
+    if (platform === 'mac') return '在 Finder 中显示';
+    if (platform === 'windows') return '在资源管理器中显示';
+    return '在文件夹中显示';
+  }
+  if (platform === 'mac') return 'Reveal in Finder';
+  if (platform === 'windows') return 'Reveal in Explorer';
+  return 'Reveal in Folder';
+}
+
+function getPlatformPanelClasses(theme: ThemeMode, platform: ShortcutPlatform) {
+  if (platform === 'mac') {
+    return theme === 'dark'
+      ? 'border-white/10 bg-[#111111]/88 shadow-[0_28px_80px_rgba(0,0,0,0.45)] backdrop-blur-3xl'
+      : 'border-white/40 bg-white/78 shadow-[0_28px_80px_rgba(15,23,42,0.18)] backdrop-blur-3xl';
+  }
+
+  return theme === 'dark'
+    ? 'border-white/12 bg-[#111111] shadow-[0_22px_64px_rgba(0,0,0,0.42)] backdrop-blur-xl'
+    : 'border-black/10 bg-white shadow-[0_22px_64px_rgba(15,23,42,0.14)] backdrop-blur-xl';
+}
+
+function getPlatformChipClasses(theme: ThemeMode, platform: ShortcutPlatform, active: boolean, activeClass: string) {
+  if (active) return activeClass;
+  if (platform === 'mac') {
+    return theme === 'dark'
+      ? 'bg-white/[0.07] text-neutral-300 hover:bg-white/[0.12] hover:text-white'
+      : 'bg-black/[0.045] text-neutral-600 hover:bg-black/[0.08] hover:text-neutral-900';
+  }
+
+  return theme === 'dark'
+    ? 'bg-white/5 text-neutral-400 hover:bg-white/10 hover:text-neutral-200'
+    : 'bg-black/5 text-neutral-600 hover:bg-black/10 hover:text-neutral-800';
+}
+
+function getPlatformIconButtonClasses(theme: ThemeMode, platform: ShortcutPlatform) {
+  if (platform === 'mac') {
+    return theme === 'dark'
+      ? 'rounded-lg border border-white/8 text-neutral-400 hover:border-white/14 hover:bg-white/10 hover:text-white'
+      : 'rounded-lg border border-black/6 text-neutral-500 hover:border-black/10 hover:bg-black/5 hover:text-black';
+  }
+
+  return theme === 'dark'
+    ? 'rounded-md text-neutral-500 hover:bg-white/10 hover:text-white'
+    : 'rounded-md text-neutral-400 hover:bg-black/5 hover:text-black';
 }
 
 function categoryBadge(clip: ClipView, language: Language) {
@@ -504,6 +644,7 @@ const TRANSLATIONS = {
 } as const;
 
 function buildDefaultSettings(): BackendSettings {
+  const defaults = getPlatformDefaultShortcuts(getShortcutDisplayPlatform());
   return {
     theme: 'system',
     language: 'zh',
@@ -516,14 +657,16 @@ function buildDefaultSettings(): BackendSettings {
     max_clips: 500,
     ignore_password_managers: true,
     plain_text_only: false,
-    screenshot_shortcut: 'Alt+S',
-    toggle_window_shortcut: 'Alt+X',
-    quick_paste_shortcut: 'CmdOrCtrl+Shift+V',
-    clear_history_shortcut: 'CmdOrCtrl+Shift+Backspace',
+    screenshot_shortcut: defaults.screenshot_shortcut,
+    toggle_window_shortcut: defaults.toggle_window_shortcut,
+    quick_paste_shortcut: defaults.quick_paste_shortcut,
+    clear_history_shortcut: defaults.clear_history_shortcut,
   };
 }
 
 export default function DesktopEnvironment() {
+  const platform = useMemo(() => getShortcutDisplayPlatform(), []);
+  const platformDefaults = useMemo(() => getPlatformDefaultShortcuts(platform), [platform]);
   const [themePreference, setThemePreference] = useState<ThemePreference>('system');
   const [systemTheme, setSystemTheme] = useState<ThemeMode>('dark');
   const [language, setLanguage] = useState<Language>('zh');
@@ -543,6 +686,7 @@ export default function DesktopEnvironment() {
   const t = TRANSLATIONS[language];
   const theme: ThemeMode = themePreference === 'system' ? systemTheme : themePreference;
   const panelOpacity = settingsData?.window_opacity ?? 0.92;
+  const pinnedClipIdSet = useMemo(() => new Set(pinnedClipIds), [pinnedClipIds]);
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -616,10 +760,10 @@ export default function DesktopEnvironment() {
     setThemePreference((effectiveSettings.theme as ThemePreference) || 'system');
     setLanguage((effectiveSettings.language as Language) || 'zh');
     startTransition(() => {
-      setClips(sortClips(clipRows.map((clip) => mapClip(clip, pinnedClipIds, autoPinnedClipId))));
-      setDeletedClips(sortClips(deletedRows.map((clip) => mapClip(clip, [], null))));
+      setClips(sortClips(clipRows.map((clip) => mapClip(clip, pinnedClipIdSet, autoPinnedClipId))));
+      setDeletedClips(sortClips(deletedRows.map((clip) => mapClip(clip, EMPTY_PINNED_CLIP_IDS, null))));
     });
-  }, [autoPinnedClipId, pinnedClipIds]);
+  }, [autoPinnedClipId, pinnedClipIdSet]);
 
   useEffect(() => {
     void syncData();
@@ -634,7 +778,7 @@ export default function DesktopEnvironment() {
       }
       startTransition(() => {
         setClips((prev) =>
-          sortClips([mapClip(event.clip, pinnedClipIds, nextAutoPinnedClipId), ...prev.filter((item) => item.id !== event.clip.id)]).slice(0, 500),
+          sortClips([mapClip(event.clip, pinnedClipIdSet, nextAutoPinnedClipId), ...prev.filter((item) => item.id !== event.clip.id)]).slice(0, 500),
         );
       });
     });
@@ -646,7 +790,7 @@ export default function DesktopEnvironment() {
       void unlistenNewClipPromise.then((unlisten) => unlisten());
       void unlistenOpenSettingsPromise.then((unlisten) => unlisten());
     };
-  }, [autoPinnedClipId, pinnedClipIds, syncData]);
+  }, [autoPinnedClipId, pinnedClipIdSet, syncData]);
 
   useEffect(() => {
     localStorage.setItem(RECENT_QUERIES_STORAGE_KEY, JSON.stringify(recentQueries));
@@ -654,8 +798,10 @@ export default function DesktopEnvironment() {
 
   useEffect(() => {
     localStorage.setItem(PINNED_CLIPS_STORAGE_KEY, JSON.stringify(pinnedClipIds));
-    setClips((prev) => sortClips(prev.map((clip) => ({ ...clip, isPinned: pinnedClipIds.includes(clip.id) || autoPinnedClipId === clip.id }))));
-  }, [autoPinnedClipId, pinnedClipIds]);
+    startTransition(() => {
+      setClips((prev) => applyPinnedState(prev, pinnedClipIdSet, autoPinnedClipId));
+    });
+  }, [autoPinnedClipId, pinnedClipIdSet, pinnedClipIds]);
 
   const patchSettings = useCallback(
     async (next: Partial<BackendSettings>) => {
@@ -707,6 +853,9 @@ export default function DesktopEnvironment() {
         showToast(t.copiedToClipboard);
       } catch (error) {
         console.error(error);
+        if (mode === 'paste') {
+          void showWindow();
+        }
         showToast(t.failed, 'error');
       }
     },
@@ -879,11 +1028,13 @@ export default function DesktopEnvironment() {
             clips={clips}
             deletedClips={deletedClips}
             language={language}
+            platform={platform}
             theme={theme}
             panelOpacity={panelOpacity}
             recentQueries={recentQueries}
             setRecentQueries={setRecentQueries}
             showShortcutHints={settingsData?.show_shortcut_hints !== false}
+            screenshotShortcut={settingsData?.screenshot_shortcut ?? platformDefaults.screenshot_shortcut}
             focusedClipId={focusedClipId}
             onFocusedClipApplied={() => setFocusedClipId(null)}
             onClose={() => void hideWindow()}
@@ -905,6 +1056,8 @@ export default function DesktopEnvironment() {
           <SettingsModal
             settings={settingsData}
             language={language}
+            platform={platform}
+            platformDefaults={platformDefaults}
             theme={theme}
             panelOpacity={panelOpacity}
             onThemeChange={(value) => void patchSettings({ theme: value })}
@@ -971,11 +1124,13 @@ function ClipboardPalette({
   clips,
   deletedClips,
   language,
+  platform,
   theme,
   panelOpacity,
   recentQueries,
   setRecentQueries,
   showShortcutHints,
+  screenshotShortcut,
   focusedClipId,
   onFocusedClipApplied,
   onClose,
@@ -992,11 +1147,13 @@ function ClipboardPalette({
   clips: ClipView[];
   deletedClips: ClipView[];
   language: Language;
+  platform: ShortcutPlatform;
   theme: ThemeMode;
   panelOpacity: number;
   recentQueries: string[];
   setRecentQueries: (next: string[] | ((prev: string[]) => string[])) => void;
   showShortcutHints: boolean;
+  screenshotShortcut: string;
   focusedClipId: string | null;
   onFocusedClipApplied: () => void;
   onClose: () => void;
@@ -1012,6 +1169,8 @@ function ClipboardPalette({
 }) {
   const t = TRANSLATIONS[language];
   const isMac = useMemo(() => getShortcutDisplayPlatform() === 'mac', []);
+  const panelClasses = useMemo(() => getPlatformPanelClasses(theme, platform), [platform, theme]);
+  const utilityButtonClasses = useMemo(() => getPlatformIconButtonClasses(theme, platform), [platform, theme]);
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -1022,7 +1181,10 @@ function ClipboardPalette({
   const [keyboardNavigation, setKeyboardNavigation] = useState(false);
   const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [scrollViewportHeight, setScrollViewportHeight] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const hoveredClipIdRef = useRef<string | null>(null);
   const isDragSelectingRef = useRef(false);
   const dragSelectTargetRef = useRef(false);
@@ -1036,14 +1198,26 @@ function ClipboardPalette({
 
   const filteredClips = useMemo(() => {
     const source = activeCategory === 'recycle' ? deletedClips : clips;
+    const queryLower = deferredQuery.toLowerCase();
     return source.filter((clip) => {
-      const matchesQuery =
-        clip.content.toLowerCase().includes(deferredQuery.toLowerCase()) || clip.source?.toLowerCase().includes(deferredQuery.toLowerCase());
+      const matchesQuery = queryLower.length === 0 ? true : clip.searchText.includes(queryLower);
       const matchesCategory = activeCategory === 'all' || activeCategory === 'recycle' ? true : getCategoryBucket(clip) === activeCategory;
       const matchesSource = activeSource === 'all' ? true : clip.source === activeSource;
       return matchesQuery && matchesCategory && matchesSource;
     });
   }, [activeCategory, activeSource, clips, deferredQuery, deletedClips]);
+
+  const shouldVirtualizeClips = !showSuggestions && activeCategory !== 'recycle' && filteredClips.length > 80;
+
+  const virtualClipWindow = useMemo(() => {
+    if (!shouldVirtualizeClips) return null;
+    return getVirtualListWindow(filteredClips.length, scrollTop, scrollViewportHeight, CLIP_ITEM_HEIGHT);
+  }, [filteredClips.length, scrollTop, scrollViewportHeight, shouldVirtualizeClips]);
+
+  const visibleClips = useMemo(
+    () => (virtualClipWindow ? filteredClips.slice(virtualClipWindow.startIndex, virtualClipWindow.endIndex) : filteredClips),
+    [filteredClips, virtualClipWindow],
+  );
 
   const saveQuery = useCallback(
     (value: string) => {
@@ -1059,6 +1233,15 @@ function ClipboardPalette({
   );
 
   const selectedClipSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
+  const currentListIsVirtualized = shouldVirtualizeClips || (activeCategory === 'recycle' && filteredClips.length > 80);
+  const recycleVirtualWindow = useMemo(() => {
+    if (activeCategory !== 'recycle' || filteredClips.length <= 80) return null;
+    return getVirtualListWindow(filteredClips.length, scrollTop, scrollViewportHeight, CLIP_ITEM_HEIGHT, CLIP_ITEM_GAP);
+  }, [activeCategory, filteredClips.length, scrollTop, scrollViewportHeight]);
+  const visibleRecycleClips = useMemo(
+    () => (recycleVirtualWindow ? filteredClips.slice(recycleVirtualWindow.startIndex, recycleVirtualWindow.endIndex) : filteredClips),
+    [filteredClips, recycleVirtualWindow],
+  );
 
   const setClipSelected = useCallback((clipId: string, selected: boolean) => {
     setSelectedClipIds((prev) => {
@@ -1167,11 +1350,80 @@ function ClipboardPalette({
   }, []);
 
   useEffect(() => {
+    const restoreSearchFocus = () => {
+      if (quickLookItem || activeCategory === 'recycle') return;
+      window.setTimeout(() => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }, 0);
+    };
+
+    restoreSearchFocus();
+    window.addEventListener('focus', restoreSearchFocus);
+    return () => window.removeEventListener('focus', restoreSearchFocus);
+  }, [activeCategory, quickLookItem]);
+
+  useEffect(() => {
+    const node = scrollContainerRef.current;
+    if (!node) return;
+
+    const updateMetrics = () => {
+      setScrollViewportHeight(node.clientHeight);
+      setScrollTop(node.scrollTop);
+    };
+
+    updateMetrics();
+
+    if (typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(() => {
+      updateMetrics();
+    });
+    observer.observe(node);
+
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const node = scrollContainerRef.current;
+    if (node) {
+      node.scrollTop = 0;
+    }
+    setScrollTop(0);
+  }, [activeCategory, activeSource, deferredQuery, showSuggestions]);
+
+  useEffect(() => {
+    if (filteredClips.length === 0) {
+      setSelectedIndex(0);
+      return;
+    }
+    setSelectedIndex((prev) => Math.min(prev, filteredClips.length - 1));
+  }, [filteredClips.length]);
+
+  useEffect(() => {
     const current = filteredClips[selectedIndex];
     if (!current) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    if (currentListIsVirtualized) {
+      const rowStride = activeCategory === 'recycle' ? CLIP_ITEM_HEIGHT + CLIP_ITEM_GAP : CLIP_ITEM_HEIGHT;
+      const itemTop = selectedIndex * rowStride;
+      const itemBottom = itemTop + CLIP_ITEM_HEIGHT;
+      const viewportTop = container.scrollTop;
+      const viewportBottom = viewportTop + container.clientHeight;
+
+      if (itemTop < viewportTop) {
+        container.scrollTop = itemTop;
+      } else if (itemBottom > viewportBottom) {
+        container.scrollTop = itemBottom - container.clientHeight;
+      }
+      return;
+    }
+
     const node = document.querySelector<HTMLElement>(`[data-clip-id="${current.id}"]`);
     node?.scrollIntoView({ block: 'nearest' });
-  }, [filteredClips, selectedIndex]);
+  }, [activeCategory, currentListIsVirtualized, filteredClips, selectedIndex]);
 
   useEffect(() => {
     const existingIds = new Set(clips.map((clip) => clip.id));
@@ -1180,12 +1432,25 @@ function ClipboardPalette({
 
   useEffect(() => {
     if (!focusedClipId) return;
-    const nextIndex = filteredClips.findIndex((clip) => clip.id === focusedClipId);
-    if (nextIndex >= 0) {
+    if (activeSource !== 'all') {
+      setActiveSource('all');
+      return;
+    }
+    if (query.length > 0 || showSuggestions) {
       setQuery('');
       setShowSuggestions(false);
       closeQuickLook();
+      return;
+    }
+    if (activeCategory !== 'images') {
+      closeQuickLook();
       setActiveCategory('images');
+      return;
+    }
+
+    const nextIndex = filteredClips.findIndex((clip) => clip.id === focusedClipId);
+    if (nextIndex >= 0) {
+      closeQuickLook();
       setSelectedIndex(nextIndex);
       onFocusedClipApplied();
       return;
@@ -1193,14 +1458,10 @@ function ClipboardPalette({
 
     const sourceIndex = clips.findIndex((clip) => clip.id === focusedClipId);
     if (sourceIndex >= 0) {
-      setQuery('');
-      setShowSuggestions(false);
       closeQuickLook();
-      setActiveCategory('images');
       setSelectedIndex(0);
-      onFocusedClipApplied();
     }
-  }, [clips, closeQuickLook, filteredClips, focusedClipId, onFocusedClipApplied]);
+  }, [activeCategory, activeSource, clips, closeQuickLook, filteredClips, focusedClipId, onFocusedClipApplied, query, showSuggestions]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1319,6 +1580,11 @@ function ClipboardPalette({
     { id: 'recycle', label: t.recycleBin },
   ] as const;
 
+  const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+    if (!currentListIsVirtualized) return;
+    setScrollTop(event.currentTarget.scrollTop);
+  }, [currentListIsVirtualized]);
+
   return (
     <div className="absolute inset-0 z-40 flex items-start justify-center pt-[10vh]">
       <motion.div
@@ -1334,9 +1600,7 @@ function ClipboardPalette({
         animate={{ opacity: panelOpacity, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: -10, scale: 0.98 }}
         transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-        className={`relative flex w-full max-w-2xl flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-2xl ${
-          theme === 'dark' ? 'border-white/10 bg-[#111111]' : 'border-black/10 bg-white'
-        }`}
+        className={`relative flex w-full max-w-2xl flex-col overflow-hidden rounded-2xl border ${panelClasses}`}
         style={{ height: '78vh', maxHeight: '78vh' }}
       >
         <div data-no-window-drag="true" className={`flex flex-col border-b ${theme === 'dark' ? 'border-white/5' : 'border-black/5'}`}>
@@ -1363,18 +1627,14 @@ function ClipboardPalette({
             <div className="flex items-center gap-2">
               <button
                 onClick={onTakeScreenshot}
-                className={`rounded-md p-1.5 transition-colors ${
-                  theme === 'dark' ? 'text-neutral-500 hover:bg-white/10 hover:text-white' : 'text-neutral-400 hover:bg-black/5 hover:text-black'
-                }`}
+                className={`p-1.5 transition-colors ${utilityButtonClasses}`}
                 title={t.screenshotShortcut}
               >
                 <Camera size={16} />
               </button>
               <button
                 onClick={onOpenSettings}
-                className={`rounded-md p-1.5 transition-colors ${
-                  theme === 'dark' ? 'text-neutral-500 hover:bg-white/10 hover:text-white' : 'text-neutral-400 hover:bg-black/5 hover:text-black'
-                }`}
+                className={`p-1.5 transition-colors ${utilityButtonClasses}`}
               >
                 <Settings size={16} />
               </button>
@@ -1386,13 +1646,7 @@ function ClipboardPalette({
               <button
                 key={category.id}
                 onClick={() => setActiveCategory(category.id)}
-                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${
-                  activeCategory === category.id
-                    ? 'bg-indigo-500 text-white'
-                    : theme === 'dark'
-                      ? 'bg-white/5 text-neutral-400 hover:bg-white/10 hover:text-neutral-200'
-                      : 'bg-black/5 text-neutral-600 hover:bg-black/10 hover:text-neutral-800'
-                }`}
+                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${getPlatformChipClasses(theme, platform, activeCategory === category.id, 'bg-indigo-500 text-white')}`}
               >
                 {category.label}
               </button>
@@ -1427,13 +1681,7 @@ function ClipboardPalette({
               <button
                 type="button"
                 onClick={() => setActiveSource('all')}
-                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${
-                  activeSource === 'all'
-                    ? 'bg-emerald-500 text-white'
-                    : theme === 'dark'
-                      ? 'bg-white/5 text-neutral-400 hover:bg-white/10 hover:text-neutral-200'
-                      : 'bg-black/5 text-neutral-600 hover:bg-black/10 hover:text-neutral-800'
-                }`}
+                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${getPlatformChipClasses(theme, platform, activeSource === 'all', 'bg-emerald-500 text-white')}`}
               >
                 {t.allSources}
               </button>
@@ -1442,13 +1690,7 @@ function ClipboardPalette({
                   key={source}
                   type="button"
                   onClick={() => setActiveSource(source)}
-                  className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${
-                    activeSource === source
-                      ? 'bg-emerald-500 text-white'
-                      : theme === 'dark'
-                        ? 'bg-white/5 text-neutral-400 hover:bg-white/10 hover:text-neutral-200'
-                        : 'bg-black/5 text-neutral-600 hover:bg-black/10 hover:text-neutral-800'
-                  }`}
+                  className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${getPlatformChipClasses(theme, platform, activeSource === source, 'bg-emerald-500 text-white')}`}
                 >
                   {source}
                 </button>
@@ -1458,7 +1700,9 @@ function ClipboardPalette({
         </div>
 
         <div
+          ref={scrollContainerRef}
           data-no-window-drag="true" className="custom-scrollbar relative flex-1 overflow-y-auto px-2 pb-3 pt-3"
+          onScroll={handleScroll}
           onMouseLeave={() => {
             hoveredClipIdRef.current = null;
           }}
@@ -1518,47 +1762,139 @@ function ClipboardPalette({
                 <p className="text-sm font-light">{t.noRecycleClips}</p>
               </div>
             ) : (
-              <div className="space-y-2">
-                {filteredClips.map((clip, index) => (
-                  <div
-                    key={clip.id}
-                    className={`flex items-center gap-3 rounded-xl border px-3 py-2 transition-colors ${
-                      keyboardNavigation && index === selectedIndex
-                        ? theme === 'dark'
-                          ? 'border-indigo-500/50 bg-indigo-500/10'
-                          : 'border-indigo-300 bg-indigo-50'
-                        : theme === 'dark'
-                          ? 'border-white/10 bg-white/5 hover:bg-white/10'
-                          : 'border-black/10 bg-white hover:bg-gray-50'
-                    }`}
-                  >
-                    <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
-                      theme === 'dark' ? 'bg-white/10 text-neutral-400' : 'bg-black/5 text-neutral-500'
-                    }`}>
-                      <Trash2 size={13} className="opacity-80" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-light">{clip.content.split('\n')[0]}</div>
-                      <div className="mt-0.5 flex items-center gap-2 text-[10px] text-neutral-500">
-                        <span>{categoryBadge(clip, language)}</span>
-                        <span className="h-1 w-1 rounded-full bg-current/40" />
-                        <span>{formatRelativeTime(clip.timestamp, language)}</span>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => onRestoreDeletedClip(clip.id)}
-                      className={`rounded-md p-1.5 transition-colors ${
-                        theme === 'dark' ? 'text-neutral-400 hover:bg-white/10 hover:text-white' : 'text-neutral-500 hover:bg-black/5 hover:text-black'
-                      }`}
-                      title={t.restore}
-                    >
-                      <RotateCcw size={13} className="opacity-80" />
-                    </button>
+              recycleVirtualWindow ? (
+                <div style={{ height: recycleVirtualWindow.totalHeight, position: 'relative' }}>
+                  <div style={{ transform: `translateY(${recycleVirtualWindow.offsetTop}px)` }} className="space-y-2">
+                    {visibleRecycleClips.map((clip, visibleIndex) => {
+                      const index = recycleVirtualWindow.startIndex + visibleIndex;
+                      return (
+                        <div
+                          key={clip.id}
+                          className={`flex h-16 items-center gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                            keyboardNavigation && index === selectedIndex
+                              ? theme === 'dark'
+                                ? 'border-indigo-500/50 bg-indigo-500/10'
+                                : 'border-indigo-300 bg-indigo-50'
+                              : theme === 'dark'
+                                ? 'border-white/10 bg-white/5 hover:bg-white/10'
+                                : 'border-black/10 bg-white hover:bg-gray-50'
+                          }`}
+                        >
+                          <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
+                            theme === 'dark' ? 'bg-white/10 text-neutral-400' : 'bg-black/5 text-neutral-500'
+                          }`}>
+                            <Trash2 size={13} className="opacity-80" />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-light">{clip.content.split('\n')[0]}</div>
+                            <div className="mt-0.5 flex items-center gap-2 text-[10px] text-neutral-500">
+                              <span>{categoryBadge(clip, language)}</span>
+                              <span className="h-1 w-1 rounded-full bg-current/40" />
+                              <span>{formatRelativeTime(clip.timestamp, language)}</span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => onRestoreDeletedClip(clip.id)}
+                            className={`rounded-md p-1.5 transition-colors ${
+                              theme === 'dark' ? 'text-neutral-400 hover:bg-white/10 hover:text-white' : 'text-neutral-500 hover:bg-black/5 hover:text-black'
+                            }`}
+                            title={t.restore}
+                          >
+                            <RotateCcw size={13} className="opacity-80" />
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
-                ))}
-              </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {filteredClips.map((clip, index) => (
+                    <div
+                      key={clip.id}
+                      className={`flex h-16 items-center gap-3 rounded-xl border px-3 py-2 transition-colors ${
+                        keyboardNavigation && index === selectedIndex
+                          ? theme === 'dark'
+                            ? 'border-indigo-500/50 bg-indigo-500/10'
+                            : 'border-indigo-300 bg-indigo-50'
+                          : theme === 'dark'
+                            ? 'border-white/10 bg-white/5 hover:bg-white/10'
+                            : 'border-black/10 bg-white hover:bg-gray-50'
+                      }`}
+                    >
+                      <div className={`flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg ${
+                        theme === 'dark' ? 'bg-white/10 text-neutral-400' : 'bg-black/5 text-neutral-500'
+                      }`}>
+                        <Trash2 size={13} className="opacity-80" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-light">{clip.content.split('\n')[0]}</div>
+                        <div className="mt-0.5 flex items-center gap-2 text-[10px] text-neutral-500">
+                          <span>{categoryBadge(clip, language)}</span>
+                          <span className="h-1 w-1 rounded-full bg-current/40" />
+                          <span>{formatRelativeTime(clip.timestamp, language)}</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onRestoreDeletedClip(clip.id)}
+                        className={`rounded-md p-1.5 transition-colors ${
+                          theme === 'dark' ? 'text-neutral-400 hover:bg-white/10 hover:text-white' : 'text-neutral-500 hover:bg-black/5 hover:text-black'
+                        }`}
+                        title={t.restore}
+                      >
+                        <RotateCcw size={13} className="opacity-80" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )
             )
+          ) : shouldVirtualizeClips && virtualClipWindow ? (
+            <div style={{ height: virtualClipWindow.totalHeight, position: 'relative' }}>
+              <div style={{ transform: `translateY(${virtualClipWindow.offsetTop}px)` }}>
+                {visibleClips.map((clip, visibleIndex) => {
+                  const index = virtualClipWindow.startIndex + visibleIndex;
+                  return (
+                    <ClipItem
+                      key={clip.id}
+                      clip={clip}
+                      language={language}
+                      theme={theme}
+                      isSelected={keyboardNavigation && index === selectedIndex}
+                      onSelect={() => setSelectedIndex(index)}
+                      onHoverStart={() => {
+                        hoveredClipIdRef.current = clip.id;
+                        setKeyboardNavigation(false);
+                      }}
+                      onHoverEnd={() => {
+                        if (hoveredClipIdRef.current === clip.id) hoveredClipIdRef.current = null;
+                      }}
+                      onPaste={() => {
+                        if (isMultiSelectMode) {
+                          toggleClipSelection(clip.id);
+                          return;
+                        }
+                        saveQuery(query);
+                        onPasteClip(clip);
+                      }}
+                      onPreview={() => openQuickLook(clip)}
+                      onCopy={() => onCopyClip(clip)}
+                      onDelete={() => onDeleteClip(clip.id)}
+                      onTogglePinned={() => onTogglePinned(clip.id)}
+                      multiSelectMode={isMultiSelectMode}
+                      isMultiSelected={selectedClipSet.has(clip.id)}
+                      onToggleSelect={() => toggleClipSelection(clip.id)}
+                      onSelectionDragStart={() => handleDragSelectStart(clip.id)}
+                      onSelectionDragEnter={() => handleDragSelectEnter(clip.id)}
+                      previewLabel={t.preview}
+                      pinLabel={clip.isPinned ? t.unpin : t.pin}
+                    />
+                  );
+                })}
+              </div>
+            </div>
           ) : (
             filteredClips.map((clip, index) => (
               <ClipItem
@@ -1601,15 +1937,15 @@ function ClipboardPalette({
 
         {showShortcutHints ? (
           <div
-            data-no-window-drag="true" className={`flex items-center justify-between border-t px-4 py-2 text-[11px] font-light ${
+            data-no-window-drag="true" className={`flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t px-4 py-2 text-[11px] font-light ${
               theme === 'dark' ? 'border-white/5 bg-black/20 text-neutral-500' : 'border-black/5 bg-black/5 text-neutral-500'
             }`}
           >
             {isMultiSelectMode && activeCategory !== 'recycle' ? (
               <>
-                <div className="flex min-w-0 items-center gap-3">
+                <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
                   <span className="truncate">{t.selectedCount.replace('{count}', String(selectedClipIds.length))}</span>
-                  <ShortcutHint theme={theme} keys={['Enter']} label={t.selectClip} />
+                  <ShortcutHint theme={theme} platform={platform} keys={['Enter']} label={t.selectClip} />
                   <button
                     type="button"
                     onClick={() => void onDeleteClips(selectedClipIds)}
@@ -1626,7 +1962,7 @@ function ClipboardPalette({
                     <Trash2 size={12} />
                   </button>
                 </div>
-                <div className="ml-4 flex min-w-0 items-center gap-2">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
                   <button
                     type="button"
                     onClick={clearClipSelection}
@@ -1651,9 +1987,9 @@ function ClipboardPalette({
               </>
             ) : activeCategory === 'recycle' ? (
               <>
-                <div className="flex min-w-0 items-center gap-3">
-                  <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
-                  <ShortcutHint theme={theme} keys={['Enter']} label={t.restore} />
+                <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                  <ShortcutHint theme={theme} platform={platform} keys={['Up', 'Down']} label={t.navigate} />
+                  <ShortcutHint theme={theme} platform={platform} keys={['Enter']} label={t.restore} />
                   <button
                     type="button"
                     onClick={onClearRecycleBin}
@@ -1665,24 +2001,25 @@ function ClipboardPalette({
                     <Trash2 size={12} />
                   </button>
                 </div>
-                <div className="ml-4 flex min-w-0 items-center gap-3">
-                  <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
+                <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                  <ShortcutHint theme={theme} platform={platform} keys={['esc']} label={t.close} />
                 </div>
               </>
             ) : (
               <>
-                <div className="flex min-w-0 items-center gap-3">
-                  <ShortcutHint theme={theme} keys={['Up', 'Down']} label={t.navigate} />
+                <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                  <ShortcutHint theme={theme} platform={platform} keys={['Up', 'Down']} label={t.navigate} />
                   <ShortcutHint
                     theme={theme}
+                    platform={platform}
                     keys={['Enter']}
                     label={t.paste}
                   />
-                  <ShortcutHint theme={theme} keys={['Space']} label={t.preview} />
+                  <ShortcutHint theme={theme} platform={platform} keys={['Space']} label={t.preview} />
                 </div>
-                <div className="ml-4 flex min-w-0 items-center gap-3">
-                  <ShortcutHint theme={theme} keys={isMac ? ['Option', 'S'] : ['Alt', 'S']} label={t.screenshotShortcut} />
-                  <ShortcutHint theme={theme} keys={['esc']} label={t.close} />
+                <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                  <ShortcutHint theme={theme} platform={platform} keys={shortcutToKeys(screenshotShortcut)} label={t.screenshotShortcut} />
+                  <ShortcutHint theme={theme} platform={platform} keys={['esc']} label={t.close} />
                 </div>
               </>
             )}
@@ -1708,6 +2045,7 @@ const QuickLookItem = memo(function QuickLookItem({
   theme: ThemeMode;
   onClose: () => void;
 }) {
+  const platform = useMemo(() => getShortcutDisplayPlatform(), []);
   const [linkPreviewFailed, setLinkPreviewFailed] = useState(false);
   const [pathActionError, setPathActionError] = useState<string | null>(null);
   const pathLikeContent = normalizePathLikeContent(clip.content);
@@ -1851,7 +2189,7 @@ const QuickLookItem = memo(function QuickLookItem({
                 }}
                 className="inline-flex h-9 items-center rounded-lg bg-indigo-500 px-4 text-sm font-light text-white transition-colors hover:bg-indigo-600"
               >
-                {TRANSLATIONS[language].revealInFinder}
+                {getRevealPathLabel(language, platform)}
               </button>
               {pathActionError ? <p className="text-xs text-red-400">{pathActionError}</p> : null}
             </div>
@@ -2124,6 +2462,8 @@ const ClipItem = memo(function ClipItem({
 function SettingsModal({
   settings,
   language,
+  platform,
+  platformDefaults,
   theme,
   panelOpacity,
   onThemeChange,
@@ -2146,6 +2486,8 @@ function SettingsModal({
 }: {
   settings: BackendSettings;
   language: Language;
+  platform: ShortcutPlatform;
+  platformDefaults: ReturnType<typeof getPlatformDefaultShortcuts>;
   theme: ThemeMode;
   panelOpacity: number;
   onThemeChange: (value: ThemePreference) => void;
@@ -2167,6 +2509,9 @@ function SettingsModal({
   onClose: () => void;
 }) {
   const t = TRANSLATIONS[language];
+  const launchAtLoginDesc = getLaunchAtLoginDescription(language, platform);
+  const shortcutHint = getShortcutHintText(language, platform, platformDefaults);
+  const panelClasses = useMemo(() => getPlatformPanelClasses(theme, platform), [platform, theme]);
   const [activeTab, setActiveTab] = useState<'general' | 'shortcuts' | 'advanced'>('general');
   const [showConfirmClear, setShowConfirmClear] = useState(false);
 
@@ -2205,18 +2550,16 @@ function SettingsModal({
         animate={{ opacity: panelOpacity, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.95, y: 10 }}
         transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-        className={`relative flex w-full max-w-2xl overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-2xl ${
-          theme === 'dark' ? 'border-white/10 bg-[#111111]' : 'border-black/10 bg-white'
-        }`}
+        className={`relative flex w-full max-w-2xl overflow-hidden rounded-2xl border ${panelClasses}`}
         style={{ height: '78vh', maxHeight: '78vh' }}
       >
         <div className={`flex w-56 flex-col gap-1 border-r p-4 ${theme === 'dark' ? 'border-white/5' : 'border-black/5'}`}>
           <div className="px-2 pb-4 pt-2">
             <h2 className={`text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.settings}</h2>
           </div>
-          <SettingsTab theme={theme} active={activeTab === 'general'} onClick={() => setActiveTab('general')} icon={<Settings size={16} />} label={t.general} />
-          <SettingsTab theme={theme} active={activeTab === 'shortcuts'} onClick={() => setActiveTab('shortcuts')} icon={<Keyboard size={16} />} label={t.shortcuts} />
-          <SettingsTab theme={theme} active={activeTab === 'advanced'} onClick={() => setActiveTab('advanced')} icon={<Monitor size={16} />} label={t.advanced} />
+          <SettingsTab theme={theme} platform={platform} active={activeTab === 'general'} onClick={() => setActiveTab('general')} icon={<Settings size={16} />} label={t.general} />
+          <SettingsTab theme={theme} platform={platform} active={activeTab === 'shortcuts'} onClick={() => setActiveTab('shortcuts')} icon={<Keyboard size={16} />} label={t.shortcuts} />
+          <SettingsTab theme={theme} platform={platform} active={activeTab === 'advanced'} onClick={() => setActiveTab('advanced')} icon={<Monitor size={16} />} label={t.advanced} />
         </div>
 
         <div className="relative flex flex-1 flex-col bg-transparent">
@@ -2250,7 +2593,7 @@ function SettingsModal({
                       />
                       <SelectRow theme={theme} label={t.language} value={language} options={[{ label: 'English', value: 'en' }, { label: '中文', value: 'zh' }]} onChange={(value) => onLanguageChange(value as Language)} />
                       <SliderSetting theme={theme} label={t.transparency} description={t.transparencyDesc} min={0} max={1} step={0.01} value={settings.window_opacity ?? 0.92} formatValue={(value) => `${Math.round(value * 100)}%`} onChange={onOpacityChange} />
-                      <ToggleSetting theme={theme} label={t.launchAtLogin} description={t.launchAtLoginDesc} checked={settings.launch_at_login} onChange={onToggleLaunchAtLogin} />
+                      <ToggleSetting theme={theme} label={t.launchAtLogin} description={launchAtLoginDesc} checked={settings.launch_at_login} onChange={onToggleLaunchAtLogin} />
                       <ToggleSetting theme={theme} label={t.playSounds} description={t.playSoundsDesc} checked={settings.play_sounds} onChange={onTogglePlaySounds} />
                       <ToggleSetting theme={theme} label={t.showShortcutHints} description={t.showShortcutHintsDesc} checked={settings.show_shortcut_hints} onChange={onToggleShortcutHints} />
                     </div>
@@ -2280,13 +2623,13 @@ function SettingsModal({
                   <div>
                     <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.shortcuts}</h3>
                     <div className="space-y-4">
-                      <ShortcutSetting theme={theme} label={t.screenshotShortcut} value={settings.screenshot_shortcut ?? 'Alt+S'} onChange={(value) => onSaveShortcut('screenshot', value)} />
-                      <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? 'Alt+X'} onChange={(value) => onSaveShortcut('toggle_window', value)} />
-                      <ShortcutSetting theme={theme} label={t.quickPaste} value={settings.quick_paste_shortcut ?? 'CmdOrCtrl+Shift+V'} onChange={(value) => onSaveShortcut('quick_paste', value)} />
+                      <ShortcutSetting theme={theme} label={t.screenshotShortcut} value={settings.screenshot_shortcut ?? platformDefaults.screenshot_shortcut} onChange={(value) => onSaveShortcut('screenshot', value)} />
+                      <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? platformDefaults.toggle_window_shortcut} onChange={(value) => onSaveShortcut('toggle_window', value)} />
+                      <ShortcutSetting theme={theme} label={t.quickPaste} value={settings.quick_paste_shortcut ?? platformDefaults.quick_paste_shortcut} onChange={(value) => onSaveShortcut('quick_paste', value)} />
                     </div>
                   </div>
                   <div className={`rounded-xl border p-4 text-sm ${theme === 'dark' ? 'border-indigo-500/20 bg-indigo-500/10 text-indigo-200' : 'border-indigo-200 bg-indigo-50 text-indigo-800'}`}>
-                    <p>{t.shortcutHint}</p>
+                    <p>{shortcutHint}</p>
                   </div>
                 </motion.div>
               ) : null}
@@ -2369,27 +2712,40 @@ function SettingsModal({
   );
 }
 
-function ShortcutHint({ theme, keys, label }: { theme: ThemeMode; keys: string[]; label: string }) {
+function ShortcutHint({ theme, platform, keys, label }: { theme: ThemeMode; platform: ShortcutPlatform; keys: string[]; label: string }) {
   return (
-    <span className="flex items-center gap-1 whitespace-nowrap">
+    <span className="flex min-w-0 items-center gap-1">
       {keys.map((key) => (
-        <kbd key={key} className={`rounded px-1 font-mono ${theme === 'dark' ? 'bg-white/10' : 'bg-black/10'}`}>
+        <kbd
+          key={key}
+          className={`font-mono ${
+            platform === 'mac'
+              ? theme === 'dark'
+                ? 'rounded-md border border-white/10 bg-white/[0.08] px-1.5 py-0.5 text-[10px] shadow-[inset_0_-1px_0_rgba(255,255,255,0.04)]'
+                : 'rounded-md border border-black/10 bg-white/70 px-1.5 py-0.5 text-[10px] shadow-[inset_0_-1px_0_rgba(15,23,42,0.06)]'
+              : theme === 'dark'
+                ? 'rounded px-1 border border-white/8 bg-white/10 text-[10px]'
+                : 'rounded px-1 border border-black/8 bg-black/10 text-[10px]'
+          }`}
+        >
           {key}
         </kbd>
       ))}
-      {label}
+      <span className="truncate">{label}</span>
     </span>
   );
 }
 
 function SettingsTab({
   theme,
+  platform,
   active,
   onClick,
   icon,
   label,
 }: {
   theme: ThemeMode;
+  platform: ShortcutPlatform;
   active: boolean;
   onClick: () => void;
   icon: ReactNode;
@@ -2400,12 +2756,20 @@ function SettingsTab({
       onClick={onClick}
       className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
         active
-          ? theme === 'dark'
-            ? 'bg-white/10 text-white'
-            : 'bg-black/10 text-black'
-          : theme === 'dark'
-            ? 'text-neutral-400 hover:bg-white/5 hover:text-neutral-200'
-            : 'text-neutral-600 hover:bg-black/5 hover:text-neutral-800'
+          ? platform === 'mac'
+            ? theme === 'dark'
+              ? 'bg-white/[0.09] text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]'
+              : 'bg-white/75 text-black shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]'
+            : theme === 'dark'
+              ? 'bg-white/10 text-white'
+              : 'bg-black/10 text-black'
+          : platform === 'mac'
+            ? theme === 'dark'
+              ? 'text-neutral-400 hover:bg-white/[0.07] hover:text-neutral-100'
+              : 'text-neutral-600 hover:bg-black/[0.04] hover:text-neutral-900'
+            : theme === 'dark'
+              ? 'text-neutral-400 hover:bg-white/5 hover:text-neutral-200'
+              : 'text-neutral-600 hover:bg-black/5 hover:text-neutral-800'
       }`}
     >
       {icon}
