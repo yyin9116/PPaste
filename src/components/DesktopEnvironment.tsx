@@ -681,6 +681,7 @@ export default function DesktopEnvironment() {
   const [toastVariant, setToastVariant] = useState<'success' | 'error'>('success');
   const [toastVisible, setToastVisible] = useState(false);
   const [focusedClipId, setFocusedClipId] = useState<string | null>(null);
+  const [isScreenshotPending, setIsScreenshotPending] = useState(false);
   const opacityPersistTimeoutRef = useRef<number | null>(null);
 
   const t = TRANSLATIONS[language];
@@ -981,6 +982,8 @@ export default function DesktopEnvironment() {
   }, [showToast, t.failed, t.recycleCleared]);
 
   const handleTakeScreenshot = useCallback(async () => {
+    if (isScreenshotPending) return;
+    setIsScreenshotPending(true);
     try {
       await takeScreenshot();
       await syncData();
@@ -993,8 +996,10 @@ export default function DesktopEnvironment() {
       }
       console.error(error);
       showToast(t.failed, 'error');
+    } finally {
+      setIsScreenshotPending(false);
     }
-  }, [playFeedbackTone, showToast, syncData, t.failed, t.screenshotCaptured]);
+  }, [isScreenshotPending, playFeedbackTone, showToast, syncData, t.failed, t.screenshotCaptured]);
 
   const handleRestoreDefaults = useCallback(async () => {
     const defaults = buildDefaultSettings();
@@ -1035,6 +1040,7 @@ export default function DesktopEnvironment() {
             setRecentQueries={setRecentQueries}
             showShortcutHints={settingsData?.show_shortcut_hints !== false}
             screenshotShortcut={settingsData?.screenshot_shortcut ?? platformDefaults.screenshot_shortcut}
+            isScreenshotPending={isScreenshotPending}
             focusedClipId={focusedClipId}
             onFocusedClipApplied={() => setFocusedClipId(null)}
             onClose={() => void hideWindow()}
@@ -1060,8 +1066,8 @@ export default function DesktopEnvironment() {
             platformDefaults={platformDefaults}
             theme={theme}
             panelOpacity={panelOpacity}
-            onThemeChange={(value) => void patchSettings({ theme: value })}
-            onLanguageChange={(value) => void patchSettings({ language: value })}
+            onThemeChange={(value) => patchSettings({ theme: value })}
+            onLanguageChange={(value) => patchSettings({ language: value })}
             onOpacityChange={(value) => {
               const next = Math.round(value * 100) / 100;
               setSettingsData((prev) => (prev ? { ...prev, window_opacity: next } : prev));
@@ -1079,20 +1085,20 @@ export default function DesktopEnvironment() {
               await setRunAtLogin(next);
               await patchSettings({ launch_at_login: next });
             }}
-            onTogglePlaySounds={() => void patchSettings({ play_sounds: !settingsData.play_sounds })}
-            onToggleShortcutHints={() => void patchSettings({ show_shortcut_hints: !settingsData.show_shortcut_hints })}
-            onRetentionChange={(value) => void patchSettings({ history_retention_days: Number(value) })}
-            onRecycleRetentionChange={(value) => void patchSettings({ recycle_bin_retention_days: Number(value) })}
-            onMaxClipsChange={(value) => void patchSettings({ max_clips: Number(value) })}
+            onTogglePlaySounds={() => patchSettings({ play_sounds: !settingsData.play_sounds })}
+            onToggleShortcutHints={() => patchSettings({ show_shortcut_hints: !settingsData.show_shortcut_hints })}
+            onRetentionChange={(value) => patchSettings({ history_retention_days: Number(value) })}
+            onRecycleRetentionChange={(value) => patchSettings({ recycle_bin_retention_days: Number(value) })}
+            onMaxClipsChange={(value) => patchSettings({ max_clips: Number(value) })}
             onToggleIgnorePasswordManagers={() =>
-              void patchSettings({ ignore_password_managers: !settingsData.ignore_password_managers })
+              patchSettings({ ignore_password_managers: !settingsData.ignore_password_managers })
             }
-            onTogglePlainTextOnly={() => void patchSettings({ plain_text_only: !settingsData.plain_text_only })}
-            onSaveShortcut={(type, shortcut) => void saveShortcut(type, shortcut)}
+            onTogglePlainTextOnly={() => patchSettings({ plain_text_only: !settingsData.plain_text_only })}
+            onSaveShortcut={(type, shortcut) => saveShortcut(type, shortcut)}
             onExport={handleExportHistory}
             onImport={handleImportHistory}
-            onRestoreDefaults={() => void handleRestoreDefaults()}
-            onClearAll={() => void handleClearAll()}
+            onRestoreDefaults={handleRestoreDefaults}
+            onClearAll={handleClearAll}
             onClose={closeSettings}
           />
         )}
@@ -1131,6 +1137,7 @@ function ClipboardPalette({
   setRecentQueries,
   showShortcutHints,
   screenshotShortcut,
+  isScreenshotPending,
   focusedClipId,
   onFocusedClipApplied,
   onClose,
@@ -1154,6 +1161,7 @@ function ClipboardPalette({
   setRecentQueries: (next: string[] | ((prev: string[]) => string[])) => void;
   showShortcutHints: boolean;
   screenshotShortcut: string;
+  isScreenshotPending: boolean;
   focusedClipId: string | null;
   onFocusedClipApplied: () => void;
   onClose: () => void;
@@ -1627,14 +1635,17 @@ function ClipboardPalette({
             <div className="flex items-center gap-2">
               <button
                 onClick={onTakeScreenshot}
-                className={`p-1.5 transition-colors ${utilityButtonClasses}`}
+                disabled={isScreenshotPending}
+                className={`p-1.5 transition-colors ${utilityButtonClasses} ${isScreenshotPending ? 'cursor-wait opacity-55' : ''}`}
                 title={t.screenshotShortcut}
+                aria-label={t.screenshotShortcut}
               >
                 <Camera size={16} />
               </button>
               <button
                 onClick={onOpenSettings}
                 className={`p-1.5 transition-colors ${utilityButtonClasses}`}
+                aria-label={t.settings}
               >
                 <Settings size={16} />
               </button>
@@ -1646,7 +1657,7 @@ function ClipboardPalette({
               <button
                 key={category.id}
                 onClick={() => setActiveCategory(category.id)}
-                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${getPlatformChipClasses(theme, platform, activeCategory === category.id, 'bg-indigo-500 text-white')}`}
+                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-normal transition-colors ${getPlatformChipClasses(theme, platform, activeCategory === category.id, 'bg-indigo-500 text-white')}`}
               >
                 {category.label}
               </button>
@@ -1681,7 +1692,7 @@ function ClipboardPalette({
               <button
                 type="button"
                 onClick={() => setActiveSource('all')}
-                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${getPlatformChipClasses(theme, platform, activeSource === 'all', 'bg-emerald-500 text-white')}`}
+                className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-normal transition-colors ${getPlatformChipClasses(theme, platform, activeSource === 'all', 'bg-indigo-500 text-white')}`}
               >
                 {t.allSources}
               </button>
@@ -1690,7 +1701,7 @@ function ClipboardPalette({
                   key={source}
                   type="button"
                   onClick={() => setActiveSource(source)}
-                  className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-light transition-colors ${getPlatformChipClasses(theme, platform, activeSource === source, 'bg-emerald-500 text-white')}`}
+                  className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-normal transition-colors ${getPlatformChipClasses(theme, platform, activeSource === source, 'bg-indigo-500 text-white')}`}
                 >
                   {source}
                 </button>
@@ -2490,22 +2501,22 @@ function SettingsModal({
   platformDefaults: ReturnType<typeof getPlatformDefaultShortcuts>;
   theme: ThemeMode;
   panelOpacity: number;
-  onThemeChange: (value: ThemePreference) => void;
-  onLanguageChange: (value: Language) => void;
+  onThemeChange: (value: ThemePreference) => Promise<void>;
+  onLanguageChange: (value: Language) => Promise<void>;
   onOpacityChange: (value: number) => void;
-  onToggleLaunchAtLogin: () => void;
-  onTogglePlaySounds: () => void;
-  onToggleShortcutHints: () => void;
-  onRetentionChange: (value: string) => void;
-  onRecycleRetentionChange: (value: string) => void;
-  onMaxClipsChange: (value: string) => void;
-  onToggleIgnorePasswordManagers: () => void;
-  onTogglePlainTextOnly: () => void;
-  onSaveShortcut: (type: 'screenshot' | 'toggle_window' | 'quick_paste', shortcut: string) => void;
-  onExport: () => void;
-  onImport: () => void;
-  onRestoreDefaults: () => void;
-  onClearAll: () => void;
+  onToggleLaunchAtLogin: () => Promise<void>;
+  onTogglePlaySounds: () => Promise<void>;
+  onToggleShortcutHints: () => Promise<void>;
+  onRetentionChange: (value: string) => Promise<void>;
+  onRecycleRetentionChange: (value: string) => Promise<void>;
+  onMaxClipsChange: (value: string) => Promise<void>;
+  onToggleIgnorePasswordManagers: () => Promise<void>;
+  onTogglePlainTextOnly: () => Promise<void>;
+  onSaveShortcut: (type: 'screenshot' | 'toggle_window' | 'quick_paste', shortcut: string) => Promise<void>;
+  onExport: () => Promise<void>;
+  onImport: () => Promise<void>;
+  onRestoreDefaults: () => Promise<void>;
+  onClearAll: () => Promise<void>;
   onClose: () => void;
 }) {
   const t = TRANSLATIONS[language];
@@ -2514,6 +2525,18 @@ function SettingsModal({
   const panelClasses = useMemo(() => getPlatformPanelClasses(theme, platform), [platform, theme]);
   const [activeTab, setActiveTab] = useState<'general' | 'shortcuts' | 'advanced'>('general');
   const [showConfirmClear, setShowConfirmClear] = useState(false);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const settingsBusy = pendingAction !== null;
+
+  const runSettingAction = useCallback(async (name: string, action: () => Promise<void>) => {
+    if (pendingAction) return;
+    setPendingAction(name);
+    try {
+      await action();
+    } finally {
+      setPendingAction(null);
+    }
+  }, [pendingAction]);
 
   const retentionOptions: SelectOption[] = [
     { label: t.days1, value: '1' },
@@ -2553,32 +2576,39 @@ function SettingsModal({
         className={`relative flex w-full max-w-2xl overflow-hidden rounded-2xl border ${panelClasses}`}
         style={{ height: '78vh', maxHeight: '78vh' }}
       >
-        <div className={`flex w-56 flex-col gap-1 border-r p-4 ${theme === 'dark' ? 'border-white/5' : 'border-black/5'}`}>
+        <div className={`flex w-56 shrink-0 flex-col gap-1 border-r p-4 ${theme === 'dark' ? 'border-white/5' : 'border-black/5'}`}>
           <div className="px-2 pb-4 pt-2">
-            <h2 className={`text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.settings}</h2>
+            <h2 className={`text-sm font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.settings}</h2>
           </div>
-          <SettingsTab theme={theme} platform={platform} active={activeTab === 'general'} onClick={() => setActiveTab('general')} icon={<Settings size={16} />} label={t.general} />
-          <SettingsTab theme={theme} platform={platform} active={activeTab === 'shortcuts'} onClick={() => setActiveTab('shortcuts')} icon={<Keyboard size={16} />} label={t.shortcuts} />
-          <SettingsTab theme={theme} platform={platform} active={activeTab === 'advanced'} onClick={() => setActiveTab('advanced')} icon={<Monitor size={16} />} label={t.advanced} />
+          <SettingsTab theme={theme} platform={platform} active={activeTab === 'general'} disabled={settingsBusy} onClick={() => setActiveTab('general')} icon={<Settings size={16} />} label={t.general} />
+          <SettingsTab theme={theme} platform={platform} active={activeTab === 'shortcuts'} disabled={settingsBusy} onClick={() => setActiveTab('shortcuts')} icon={<Keyboard size={16} />} label={t.shortcuts} />
+          <SettingsTab theme={theme} platform={platform} active={activeTab === 'advanced'} disabled={settingsBusy} onClick={() => setActiveTab('advanced')} icon={<Monitor size={16} />} label={t.advanced} />
         </div>
 
-        <div className="relative flex flex-1 flex-col bg-transparent">
+        <div className="relative flex min-w-0 flex-1 flex-col bg-transparent">
+          <div className={`flex h-14 shrink-0 items-center justify-between border-b px-8 ${theme === 'dark' ? 'border-white/5 bg-black/10' : 'border-black/5 bg-white/30'}`}>
+            <h3 className={`text-sm font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>
+              {activeTab === 'general' ? t.general : activeTab === 'shortcuts' ? t.shortcuts : t.advanced}
+            </h3>
+            {settingsBusy ? <span className="text-[11px] text-neutral-500">{language === 'zh' ? '正在保存...' : 'Saving...'}</span> : null}
+          </div>
           <button
             onClick={onClose}
+            disabled={settingsBusy}
             title={t.closeSettings}
-            className={`absolute right-4 top-4 z-10 rounded-md p-1.5 transition-colors ${
+            className={`absolute right-4 top-3 z-10 rounded-md p-1.5 transition-colors ${
               theme === 'dark' ? 'text-neutral-500 hover:bg-white/10 hover:text-white' : 'text-neutral-400 hover:bg-black/5 hover:text-black'
-            }`}
+            } ${settingsBusy ? 'cursor-not-allowed opacity-45' : ''}`}
           >
             <X size={16} />
           </button>
 
-          <div className="custom-scrollbar flex-1 overflow-y-auto px-8 pb-12 pt-14">
+          <div className="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-6">
             <AnimatePresence mode="wait">
               {activeTab === 'general' ? (
                 <motion.div key="general" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.15 }} className="space-y-8">
                   <div>
-                    <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.general}</h3>
+                    <h3 className={`mb-4 text-base font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.general}</h3>
                     <div className="space-y-4">
                       <SelectRow
                         theme={theme}
@@ -2589,30 +2619,32 @@ function SettingsModal({
                           { label: t.dark, value: 'dark' },
                           { label: t.light, value: 'light' },
                         ]}
-                        onChange={(value) => onThemeChange(value as ThemePreference)}
+                        disabled={settingsBusy}
+                        onChange={(value) => runSettingAction('theme', () => onThemeChange(value as ThemePreference))}
                       />
-                      <SelectRow theme={theme} label={t.language} value={language} options={[{ label: 'English', value: 'en' }, { label: '中文', value: 'zh' }]} onChange={(value) => onLanguageChange(value as Language)} />
-                      <SliderSetting theme={theme} label={t.transparency} description={t.transparencyDesc} min={0} max={1} step={0.01} value={settings.window_opacity ?? 0.92} formatValue={(value) => `${Math.round(value * 100)}%`} onChange={onOpacityChange} />
-                      <ToggleSetting theme={theme} label={t.launchAtLogin} description={launchAtLoginDesc} checked={settings.launch_at_login} onChange={onToggleLaunchAtLogin} />
-                      <ToggleSetting theme={theme} label={t.playSounds} description={t.playSoundsDesc} checked={settings.play_sounds} onChange={onTogglePlaySounds} />
-                      <ToggleSetting theme={theme} label={t.showShortcutHints} description={t.showShortcutHintsDesc} checked={settings.show_shortcut_hints} onChange={onToggleShortcutHints} />
+                      <SelectRow theme={theme} label={t.language} value={language} options={[{ label: 'English', value: 'en' }, { label: '中文', value: 'zh' }]} disabled={settingsBusy} onChange={(value) => runSettingAction('language', () => onLanguageChange(value as Language))} />
+                      <SliderSetting theme={theme} label={t.transparency} description={t.transparencyDesc} min={0} max={1} step={0.01} value={settings.window_opacity ?? 0.92} formatValue={(value) => `${Math.round(value * 100)}%`} disabled={settingsBusy} onChange={onOpacityChange} />
+                      <ToggleSetting theme={theme} label={t.launchAtLogin} description={launchAtLoginDesc} checked={settings.launch_at_login} disabled={settingsBusy} onChange={() => runSettingAction('launch', onToggleLaunchAtLogin)} />
+                      <ToggleSetting theme={theme} label={t.playSounds} description={t.playSoundsDesc} checked={settings.play_sounds} disabled={settingsBusy} onChange={() => runSettingAction('sounds', onTogglePlaySounds)} />
+                      <ToggleSetting theme={theme} label={t.showShortcutHints} description={t.showShortcutHintsDesc} checked={settings.show_shortcut_hints} disabled={settingsBusy} onChange={() => runSettingAction('hints', onToggleShortcutHints)} />
                     </div>
                   </div>
 
                   <div className={`h-px ${theme === 'dark' ? 'bg-white/5' : 'bg-black/5'}`} />
 
                   <div>
-                    <h3 className={`mb-4 text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.historyRetention}</h3>
+                    <h3 className={`mb-4 text-sm font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.historyRetention}</h3>
                     <div className="space-y-3">
-                      <SelectRow theme={theme} label={t.keepHistoryFor} value={String(settings.history_retention_days)} options={retentionOptions} onChange={onRetentionChange} />
+                      <SelectRow theme={theme} label={t.keepHistoryFor} value={String(settings.history_retention_days)} options={retentionOptions} disabled={settingsBusy} onChange={(value) => runSettingAction('retention', () => onRetentionChange(value))} />
                       <SelectRow
                         theme={theme}
                         label={t.recycleBinRetention}
                         value={String(settings.recycle_bin_retention_days ?? 30)}
                         options={retentionOptions}
-                        onChange={onRecycleRetentionChange}
+                        disabled={settingsBusy}
+                        onChange={(value) => runSettingAction('recycle-retention', () => onRecycleRetentionChange(value))}
                       />
-                      <SelectRow theme={theme} label={t.maxClips} value={String(settings.max_clips)} options={maxClipOptions} onChange={onMaxClipsChange} />
+                      <SelectRow theme={theme} label={t.maxClips} value={String(settings.max_clips)} options={maxClipOptions} disabled={settingsBusy} onChange={(value) => runSettingAction('max-clips', () => onMaxClipsChange(value))} />
                     </div>
                   </div>
                 </motion.div>
@@ -2621,14 +2653,14 @@ function SettingsModal({
               {activeTab === 'shortcuts' ? (
                 <motion.div key="shortcuts" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.15 }} className="space-y-8">
                   <div>
-                    <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.shortcuts}</h3>
+                    <h3 className={`mb-4 text-base font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.shortcuts}</h3>
                     <div className="space-y-4">
-                      <ShortcutSetting theme={theme} label={t.screenshotShortcut} value={settings.screenshot_shortcut ?? platformDefaults.screenshot_shortcut} onChange={(value) => onSaveShortcut('screenshot', value)} />
-                      <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? platformDefaults.toggle_window_shortcut} onChange={(value) => onSaveShortcut('toggle_window', value)} />
-                      <ShortcutSetting theme={theme} label={t.quickPaste} value={settings.quick_paste_shortcut ?? platformDefaults.quick_paste_shortcut} onChange={(value) => onSaveShortcut('quick_paste', value)} />
+                      <ShortcutSetting theme={theme} label={t.screenshotShortcut} value={settings.screenshot_shortcut ?? platformDefaults.screenshot_shortcut} disabled={settingsBusy} onChange={(value) => runSettingAction('shortcut-screenshot', () => onSaveShortcut('screenshot', value))} />
+                      <ShortcutSetting theme={theme} label={t.toggleClipboard} value={settings.toggle_window_shortcut ?? platformDefaults.toggle_window_shortcut} disabled={settingsBusy} onChange={(value) => runSettingAction('shortcut-toggle', () => onSaveShortcut('toggle_window', value))} />
+                      <ShortcutSetting theme={theme} label={t.quickPaste} value={settings.quick_paste_shortcut ?? platformDefaults.quick_paste_shortcut} disabled={settingsBusy} onChange={(value) => runSettingAction('shortcut-paste', () => onSaveShortcut('quick_paste', value))} />
                     </div>
                   </div>
-                  <div className={`rounded-xl border p-4 text-sm ${theme === 'dark' ? 'border-indigo-500/20 bg-indigo-500/10 text-indigo-200' : 'border-indigo-200 bg-indigo-50 text-indigo-800'}`}>
+                  <div className={`rounded-xl border p-4 text-sm leading-6 ${theme === 'dark' ? 'border-indigo-500/20 bg-indigo-500/10 text-indigo-200' : 'border-indigo-200 bg-indigo-50 text-indigo-800'}`}>
                     <p>{shortcutHint}</p>
                   </div>
                 </motion.div>
@@ -2637,21 +2669,21 @@ function SettingsModal({
               {activeTab === 'advanced' ? (
                 <motion.div key="advanced" initial={{ opacity: 0, x: 10 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -10 }} transition={{ duration: 0.15 }} className="space-y-8">
                   <div>
-                    <h3 className={`mb-4 text-lg font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.advanced}</h3>
+                    <h3 className={`mb-4 text-base font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.advanced}</h3>
                     <div className="space-y-4">
-                      <ToggleSetting theme={theme} label={t.ignorePasswordManagers} description={t.ignorePasswordManagersDesc} checked={settings.ignore_password_managers} onChange={onToggleIgnorePasswordManagers} />
-                      <ToggleSetting theme={theme} label={t.plainTextOnly} description={t.plainTextOnlyDesc} checked={settings.plain_text_only} onChange={onTogglePlainTextOnly} />
+                      <ToggleSetting theme={theme} label={t.ignorePasswordManagers} description={t.ignorePasswordManagersDesc} checked={settings.ignore_password_managers} disabled={settingsBusy} onChange={() => runSettingAction('password-managers', onToggleIgnorePasswordManagers)} />
+                      <ToggleSetting theme={theme} label={t.plainTextOnly} description={t.plainTextOnlyDesc} checked={settings.plain_text_only} disabled={settingsBusy} onChange={() => runSettingAction('plain-text', onTogglePlainTextOnly)} />
                     </div>
                   </div>
 
                   <div className={`h-px ${theme === 'dark' ? 'bg-white/5' : 'bg-black/5'}`} />
 
                   <div>
-                    <h3 className={`mb-4 text-sm font-light ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.dataManagement}</h3>
+                    <h3 className={`mb-4 text-sm font-medium ${theme === 'dark' ? 'text-white' : 'text-black'}`}>{t.dataManagement}</h3>
                     <div className="space-y-4">
-                      <ActionRow theme={theme} title={t.exportHistory} description={t.exportDesc} actionLabel={t.exportHistory} onClick={onExport} />
-                      <ActionRow theme={theme} title={t.restoreDefaults} description={t.restoreDefaultsDesc} actionLabel={t.restoreDefaults} onClick={onRestoreDefaults} />
-                      <ActionRow theme={theme} title={t.importHistory} description={t.importDesc} actionLabel={t.importHistory} onClick={onImport} />
+                      <ActionRow theme={theme} title={t.exportHistory} description={t.exportDesc} actionLabel={t.exportHistory} disabled={settingsBusy} onClick={() => runSettingAction('export', onExport)} />
+                      <ActionRow theme={theme} title={t.restoreDefaults} description={t.restoreDefaultsDesc} actionLabel={t.restoreDefaults} disabled={settingsBusy} onClick={() => runSettingAction('defaults', onRestoreDefaults)} />
+                      <ActionRow theme={theme} title={t.importHistory} description={t.importDesc} actionLabel={t.importHistory} disabled={settingsBusy} onClick={() => runSettingAction('import', onImport)} />
                     </div>
                   </div>
 
@@ -2662,10 +2694,11 @@ function SettingsModal({
                     {!showConfirmClear ? (
                       <div>
                         <button
+                          disabled={settingsBusy}
                           onClick={() => setShowConfirmClear(true)}
                           className={`rounded-lg border px-4 py-2 text-sm font-light transition-colors ${
                             theme === 'dark' ? 'border-red-500/20 bg-red-500/10 text-red-400 hover:bg-red-500/20' : 'border-red-200 bg-red-50 text-red-600 hover:bg-red-100'
-                          }`}
+                          } ${settingsBusy ? 'cursor-not-allowed opacity-55' : ''}`}
                         >
                           {t.clearAllHistory}
                         </button>
@@ -2680,11 +2713,12 @@ function SettingsModal({
                             <p className={`mb-4 mt-1 text-xs ${theme === 'dark' ? 'text-red-400/70' : 'text-red-600/70'}`}>{t.clearWarning}</p>
                             <div className="flex items-center gap-2">
                               <button
+                                disabled={settingsBusy}
                                 onClick={() => {
-                                  onClearAll();
+                                  void runSettingAction('clear-all', onClearAll);
                                   setShowConfirmClear(false);
                                 }}
-                                className="rounded-md bg-red-500 px-3 py-1.5 text-xs font-light text-white transition-colors hover:bg-red-600"
+                                className={`rounded-md bg-red-500 px-3 py-1.5 text-xs font-light text-white transition-colors hover:bg-red-600 ${settingsBusy ? 'cursor-not-allowed opacity-55' : ''}`}
                               >
                                 {t.confirm}
                               </button>
@@ -2740,6 +2774,7 @@ function SettingsTab({
   theme,
   platform,
   active,
+  disabled,
   onClick,
   icon,
   label,
@@ -2747,12 +2782,15 @@ function SettingsTab({
   theme: ThemeMode;
   platform: ShortcutPlatform;
   active: boolean;
+  disabled?: boolean;
   onClick: () => void;
   icon: ReactNode;
   label: string;
 }) {
   return (
     <button
+      type="button"
+      disabled={disabled}
       onClick={onClick}
       className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm transition-colors ${
         active
@@ -2770,10 +2808,10 @@ function SettingsTab({
             : theme === 'dark'
               ? 'text-neutral-400 hover:bg-white/5 hover:text-neutral-200'
               : 'text-neutral-600 hover:bg-black/5 hover:text-neutral-800'
-      }`}
+      } ${disabled ? 'cursor-not-allowed opacity-55' : ''}`}
     >
       {icon}
-      {label}
+      <span className="truncate font-normal">{label}</span>
     </button>
   );
 }
@@ -2783,26 +2821,29 @@ function ToggleSetting({
   label,
   description,
   checked,
+  disabled,
   onChange,
 }: {
   theme: ThemeMode;
   label: string;
   description: string;
   checked: boolean;
+  disabled?: boolean;
   onChange: () => void;
 }) {
   return (
-    <div className="group flex items-center justify-between">
-      <div className="pr-4">
-        <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
-        <div className="mt-0.5 text-xs text-neutral-500">{description}</div>
+    <div className="group flex min-h-12 items-center justify-between gap-5">
+      <div className="min-w-0 flex-1">
+        <div className={`text-sm font-normal ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+        <div className="mt-0.5 text-xs leading-5 text-neutral-500">{description}</div>
       </div>
       <button
         type="button"
+        disabled={disabled}
         onClick={onChange}
         className={`relative inline-flex h-6 w-10 flex-shrink-0 items-center rounded-full p-1 transition-colors ${
           checked ? 'bg-indigo-500' : theme === 'dark' ? 'bg-white/10' : 'bg-black/10'
-        }`}
+        } ${disabled ? 'cursor-not-allowed opacity-55' : ''}`}
       >
         <span className={`h-4 w-4 rounded-full bg-white transition-transform ${checked ? 'translate-x-4' : 'translate-x-0'}`} />
       </button>
@@ -2815,34 +2856,37 @@ function SelectRow({
   label,
   value,
   options,
+  disabled,
   onChange,
 }: {
   theme: ThemeMode;
   label: string;
   value: string;
   options: SelectOption[];
+  disabled?: boolean;
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const current = options.find((option) => option.value === value) ?? options[0];
 
   return (
-    <div className="relative flex items-center justify-between">
-      <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+    <div className="relative flex min-h-10 items-center justify-between gap-5">
+      <div className={`min-w-0 flex-1 truncate text-sm font-normal ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
       <button
         type="button"
+        disabled={disabled}
         onClick={() => setOpen((prev) => !prev)}
         className={`inline-flex h-8 min-w-[128px] items-center justify-between rounded-lg border px-3 text-sm transition-colors ${
           theme === 'dark'
             ? 'border-white/10 bg-white/5 text-neutral-200 hover:bg-white/10'
             : 'border-black/10 bg-black/5 text-neutral-800 hover:bg-black/10'
-        }`}
+        } ${disabled ? 'cursor-not-allowed opacity-55' : ''}`}
       >
-        <span>{current?.label}</span>
+        <span className="truncate">{current?.label}</span>
         <ChevronDown size={14} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
       <AnimatePresence>
-        {open ? (
+        {open && !disabled ? (
           <motion.div
             initial={{ opacity: 0, y: 6, scale: 0.98 }}
             animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -2890,6 +2934,7 @@ function SliderSetting({
   step,
   value,
   formatValue,
+  disabled,
   onChange,
 }: {
   theme: ThemeMode;
@@ -2900,6 +2945,7 @@ function SliderSetting({
   step: number;
   value: number;
   formatValue: (value: number) => string;
+  disabled?: boolean;
   onChange: (value: number) => void;
 }) {
   const progress = `${((value - min) / (max - min)) * 100}%`;
@@ -2908,8 +2954,8 @@ function SliderSetting({
     <div className="space-y-2">
       <div className="flex items-end justify-between gap-3">
         <div className="min-w-0">
-          <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
-          <div className="mt-0.5 text-xs text-neutral-500">{description}</div>
+          <div className={`text-sm font-normal ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+          <div className="mt-0.5 text-xs leading-5 text-neutral-500">{description}</div>
         </div>
         <span className="flex-shrink-0 text-[11px] font-light text-neutral-500">{formatValue(value)}</span>
       </div>
@@ -2919,13 +2965,14 @@ function SliderSetting({
         max={max}
         step={step}
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(Number(event.target.value))}
-        className="h-2 w-full cursor-pointer appearance-none rounded-full bg-transparent"
+        className={`h-2 w-full appearance-none rounded-full bg-transparent ${disabled ? 'cursor-not-allowed opacity-55' : 'cursor-pointer'}`}
         style={{
           background:
             theme === 'dark'
-              ? `linear-gradient(to right, rgb(20 184 166) 0%, rgb(20 184 166) ${progress}, rgba(255,255,255,0.08) ${progress}, rgba(255,255,255,0.08) 100%)`
-              : `linear-gradient(to right, rgb(20 184 166) 0%, rgb(20 184 166) ${progress}, rgba(0,0,0,0.08) ${progress}, rgba(0,0,0,0.08) 100%)`,
+              ? `linear-gradient(to right, rgb(99 102 241) 0%, rgb(99 102 241) ${progress}, rgba(255,255,255,0.08) ${progress}, rgba(255,255,255,0.08) 100%)`
+              : `linear-gradient(to right, rgb(99 102 241) 0%, rgb(99 102 241) ${progress}, rgba(0,0,0,0.08) ${progress}, rgba(0,0,0,0.08) 100%)`,
         }}
       />
     </div>
@@ -2937,25 +2984,29 @@ function ActionRow({
   title,
   description,
   actionLabel,
+  disabled,
   onClick,
 }: {
   theme: ThemeMode;
   title: string;
   description: string;
   actionLabel: string;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   return (
-    <div className="flex items-center justify-between">
-      <div>
-        <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{title}</div>
-        <div className="mt-0.5 text-xs text-neutral-500">{description}</div>
+    <div className="flex min-h-12 items-center justify-between gap-5">
+      <div className="min-w-0 flex-1">
+        <div className={`text-sm font-normal ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{title}</div>
+        <div className="mt-0.5 text-xs leading-5 text-neutral-500">{description}</div>
       </div>
       <button
+        type="button"
+        disabled={disabled}
         onClick={onClick}
         className={`inline-flex h-8 shrink-0 items-center whitespace-nowrap rounded-lg px-3 text-xs font-light transition-colors ${
           theme === 'dark' ? 'bg-white/5 text-neutral-200 hover:bg-white/10' : 'bg-black/5 text-neutral-800 hover:bg-black/10'
-        }`}
+        } ${disabled ? 'cursor-not-allowed opacity-55' : ''}`}
       >
         {actionLabel}
       </button>
@@ -2967,11 +3018,13 @@ function ShortcutSetting({
   theme,
   label,
   value,
+  disabled,
   onChange,
 }: {
   theme: ThemeMode;
   label: string;
   value: string;
+  disabled?: boolean;
   onChange: (value: string) => void;
 }) {
   const [isRecording, setIsRecording] = useState(false);
@@ -3010,17 +3063,18 @@ function ShortcutSetting({
   }, [isRecording, onChange]);
 
   return (
-    <div className="flex items-center justify-between">
-      <div className={`text-sm font-light ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
+    <div className="flex min-h-10 items-center justify-between gap-5">
+      <div className={`min-w-0 flex-1 truncate text-sm font-normal ${theme === 'dark' ? 'text-neutral-200' : 'text-neutral-800'}`}>{label}</div>
       <button
         ref={triggerRef}
         type="button"
+        disabled={disabled}
         onClick={() => setIsRecording(true)}
         className={`inline-flex h-8 min-w-[132px] items-center rounded-lg border px-3 text-sm outline-none transition-colors ${
           theme === 'dark'
             ? 'border-white/10 bg-white/5 text-neutral-200 focus:border-indigo-500/50'
             : 'border-black/10 bg-black/5 text-neutral-800 focus:border-indigo-500/50'
-        }`}
+        } ${disabled ? 'cursor-not-allowed opacity-55' : ''}`}
       >
         <span className="font-mono">{isRecording ? '...' : shortcutToDisplay(value)}</span>
       </button>
