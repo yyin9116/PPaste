@@ -135,11 +135,40 @@ pub struct AppState {
     pub active_toggle_shortcut: Arc<Mutex<String>>,
     pub active_quick_paste_shortcut: Arc<Mutex<String>>,
     pub active_clear_history_shortcut: Arc<Mutex<String>>,
+    pub is_capturing_screenshot: Arc<Mutex<bool>>,
     pub awaiting_focus_after_show: Arc<Mutex<bool>>,
     pub last_frontmost_app: Arc<Mutex<Option<String>>>,
     pub duplicate_hit_counts: Arc<Mutex<HashMap<u64, u32>>>,
     pub auto_pinned_signature: Arc<Mutex<Option<u64>>>,
     pub tray_id: String,
+}
+
+struct ScreenshotCaptureGuard {
+    flag: Arc<Mutex<bool>>,
+}
+
+impl ScreenshotCaptureGuard {
+    fn acquire(flag: Arc<Mutex<bool>>) -> Result<Self, String> {
+        {
+            let mut is_capturing = flag
+                .lock()
+                .map_err(|_| "Screenshot state unavailable".to_string())?;
+            if *is_capturing {
+                return Err("Screenshot already in progress".to_string());
+            }
+            *is_capturing = true;
+        }
+
+        Ok(Self { flag })
+    }
+}
+
+impl Drop for ScreenshotCaptureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut is_capturing) = self.flag.lock() {
+            *is_capturing = false;
+        }
+    }
 }
 
 // --- 数据库初始化 ---
@@ -1860,6 +1889,8 @@ fn update_shortcut(
 fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<String, String> {
     use std::process::Command;
 
+    let _capture_guard = ScreenshotCaptureGuard::acquire(Arc::clone(&state.is_capturing_screenshot))?;
+
     #[cfg(target_os = "macos")]
     remember_frontmost_app(app);
 
@@ -1961,8 +1992,15 @@ fn capture_screenshot_to_history(app: &AppHandle, state: &AppState) -> Result<St
             .and_then(|mut clipboard| clipboard.get_image().ok())
             .map(|image| hash_image(image.bytes.as_ref()));
 
-        let launch_status = Command::new("cmd")
-            .args(["/C", "start", "", "ms-screenclip:"])
+        let launch_status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Start-Process 'ms-screenclip:' -WindowStyle Hidden",
+            ])
             .status();
 
         let png_bytes = if launch_status.is_ok() {
@@ -2475,6 +2513,7 @@ pub fn run() {
         active_clear_history_shortcut: Arc::new(Mutex::new(
             default_settings.clear_history_shortcut.clone(),
         )),
+        is_capturing_screenshot: Arc::new(Mutex::new(false)),
         awaiting_focus_after_show: Arc::new(Mutex::new(false)),
         last_frontmost_app: Arc::new(Mutex::new(None)),
         duplicate_hit_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -2541,14 +2580,7 @@ pub fn run() {
                         event,
                         TrayIconEvent::Click {
                             button: MouseButton::Left,
-                            button_state: MouseButtonState::Down,
-                            ..
-                        } | TrayIconEvent::Click {
-                            button: MouseButton::Left,
                             button_state: MouseButtonState::Up,
-                            ..
-                        } | TrayIconEvent::DoubleClick {
-                            button: MouseButton::Left,
                             ..
                         }
                     );
