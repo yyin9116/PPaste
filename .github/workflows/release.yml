@@ -43,6 +43,41 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify release version metadata
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          TAURI_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          CARGO_VERSION="$(grep -m1 '^version = ' src-tauri/Cargo.toml | sed -E 's/version = \"([^\"]+)\"/\\1/')"
+          LOCK_VERSION="$(awk '
+            $0 == "name = \"ppaste\"" { in_package = 1; next }
+            in_package && /^version = / {
+              gsub(/version = "|"/, "")
+              print
+              exit
+            }
+          ' src-tauri/Cargo.lock)"
+
+          echo "tag=$TAG_VERSION package=$PACKAGE_VERSION tauri=$TAURI_VERSION cargo=$CARGO_VERSION lock=$LOCK_VERSION"
+
+          if [[ "$PACKAGE_VERSION" != "$TAG_VERSION" ]]; then
+            echo "::error::package.json version $PACKAGE_VERSION does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          if [[ "$TAURI_VERSION" != "$TAG_VERSION" ]]; then
+            echo "::error::tauri.conf.json version $TAURI_VERSION does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          if [[ "$CARGO_VERSION" != "$TAG_VERSION" ]]; then
+            echo "::error::Cargo.toml version $CARGO_VERSION does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          if [[ "$LOCK_VERSION" != "$TAG_VERSION" ]]; then
+            echo "::error::Cargo.lock ppaste version $LOCK_VERSION does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+
       - name: Warn about unsigned macOS distribution
         if: matrix.os == 'macos-14'
         env:
