@@ -49,7 +49,7 @@ jobs:
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           TAURI_VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          CARGO_VERSION="$(grep -m1 '^version = ' src-tauri/Cargo.toml | sed -E 's/version = \"([^\"]+)\"/\\1/')"
+          CARGO_VERSION="$(node -p "require('fs').readFileSync('src-tauri/Cargo.toml', 'utf8').match(/^version = \\\"([^\\\"]+)\\\"/m)[1]")"
           LOCK_VERSION="$(awk '
             $0 == "name = \"ppaste\"" { in_package = 1; next }
             in_package && /^version = / {
